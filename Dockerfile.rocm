@@ -138,8 +138,8 @@ FROM scratch AS export_aotriton
 COPY --from=build_aotriton /opt/rocm/aotriton/ /aotriton/
 
 FROM base as build_pytorch
-ARG PYTORCH_BRANCH="release/2.4"
-ARG PYTORCH_VISION_BRANCH="v0.19.0"
+ARG PYTORCH_BRANCH="release/2.5"
+ARG PYTORCH_VISION_BRANCH="v0.20.0"
 ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 #RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
