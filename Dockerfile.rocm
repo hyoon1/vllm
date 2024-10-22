@@ -88,7 +88,7 @@ FROM export_flash_attn_${BUILD_FA} AS export_flash_attn
 # -----------------------
 # Triton build stages
 FROM base AS build_triton
-ARG TRITON_BRANCH="e192dba"
+ARG TRITON_BRANCH="release/3.1.x"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 RUN python3 -m pip install ninja cmake wheel pybind11 && git clone ${TRITON_REPO} \
     && cd triton \
@@ -108,11 +108,38 @@ RUN cd /opt/rocm/share/amd_smi \
 FROM scratch AS export_amdsmi
 COPY --from=build_amdsmi /opt/rocm/share/amd_smi/dist/*.whl /
 
+# aotriton build stages
+FROM base AS build_aotriton
+ARG AOTRITON_BRANCH="0.7.1b"
+
+RUN if echo "${ARG_PYTORCH_ROCM_ARCH}" | grep -q "gfx90a"; then \
+        TARGET_GPUS="MI200"; \
+    elif echo "${ARG_PYTORCH_ROCM_ARCH}" | grep -q "gfx942"; then \
+        TARGET_GPUS="MI300X"; \
+    elif echo "${ARG_PYTORCH_ROCM_ARCH}" | grep -q "gfx110"; then \
+        TARGET_GPUS="Navi31"; \
+    else \
+        echo "Unsupported GPU architecture"; \
+        exit 1; \
+    fi \
+    && git clone https://github.com/ROCm/aotriton.git -b ${AOTRITON_BRANCH} aotriton_${AOTRITON_BRANCH} \
+    && cd aotriton_${AOTRITON_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt \
+    && apt update \
+    && apt install -y libzstd-dev \
+    && mkdir build \
+    && cd build \
+    && export PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:${CONDA_PREFIX}/lib/pkgconfig" \
+    && cmake .. -DCMAKE_INSTALL_PREFIX=/opt/rocm/aotriton -DCMAKE_BUILD_TYPE=Release -DAOTRITON_GPU_BUILD_TIMEOUT=0 -DTARGET_GPUS=${TARGET_GPUS} -G Ninja \
+    && ninja install
+
+FROM scratch AS export_aotriton
+COPY --from=build_aotriton /opt/rocm/aotriton/ /aotriton/
+
 FROM base as build_pytorch
-# A commit to fix the output scaling factor issue in _scaled_mm
-# Not yet in 2.5.0-rc1
-ARG PYTORCH_BRANCH="cedc116"
-ARG PYTORCH_VISION_BRANCH="v0.19.1"
+ARG PYTORCH_BRANCH="release/2.4"
+ARG PYTORCH_VISION_BRANCH="v0.19.0"
 ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 #RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
@@ -122,6 +149,9 @@ ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 #    && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
 #    && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status; \
 #fi
+# Install aotriton
+COPY --from=export_aotriton /aotriton/ /opt/rocm/aotriton/
+
 RUN git clone ${PYTORCH_REPO} pytorch \
     && cd pytorch && git checkout ${PYTORCH_BRANCH} && git submodule update --init --recursive \
     && python tools/amd_build/build_amd.py \
@@ -144,7 +174,7 @@ FROM base AS fetch_vllm_0
 ONBUILD COPY ./ vllm/
 FROM base AS fetch_vllm_1
 ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
-ARG VLLM_BRANCH="main"
+ARG VLLM_BRANCH="v0.6.2+rocm"
 ONBUILD RUN git clone ${VLLM_REPO} \
 	    && cd vllm \
 	    && git checkout ${VLLM_BRANCH}
@@ -155,6 +185,9 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 FROM fetch_vllm AS build_vllm
 ARG COMMON_WORKDIR
 ARG USE_CYTHON
+# Install aotriton
+RUN --mount=type=bind,from=export_aotriton,src=/aotriton,target=/install/aotriton \
+    cp -r /install/aotriton/* /opt/rocm/aotriton/
 # Install hipblaslt
 RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
 if ls /install/*.deb; then \
@@ -168,11 +201,13 @@ RUN --mount=type=bind,from=export_pytorch,src=/,target=/install \
 if ls /install/*.whl; then \
     pip install /install/*.whl; \
 fi
+
 # Build vLLM
 RUN cd vllm \
+    && python3 -m pip install -r requirements-rocm.txt \
     && python3 setup.py clean --all  \
     && if [ ${USE_CYTHON} -eq "1" ]; then python3 setup_cython.py build_ext --inplace; fi \
-    && python3 setup.py bdist_wheel --dist-dir=dist
+    && SCCACHE_IDLE_TIMEOUT=1800 python3 setup.py bdist_wheel --dist-dir=dist
 # Build gradlib
 RUN cd vllm/gradlib \
     && python3 setup.py clean --all && python3 setup.py bdist_wheel --dist-dir=dist
@@ -201,6 +236,9 @@ RUN case "$(which python3)" in \
         *"/opt/conda/envs/py_3.9"*) \
             rm -rf /opt/conda/envs/py_3.9/lib/python3.9/site-packages/numpy-1.20.3.dist-info/;; \
         *) ;; esac
+
+RUN --mount=type=bind,from=export_aotriton,src=/aotriton,target=/install/aotriton \
+cp -r /install/aotriton/* /opt/rocm/aotriton/
 
 RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
     if ls /install/*.deb; then \
