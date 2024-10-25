@@ -108,34 +108,16 @@ RUN cd /opt/rocm/share/amd_smi \
 FROM scratch AS export_amdsmi
 COPY --from=build_amdsmi /opt/rocm/share/amd_smi/dist/*.whl /
 
-# aotriton build stages
-FROM base AS build_aotriton
-ARG AOTRITON_BRANCH="0.7.1b"
-
-RUN if echo "${ARG_PYTORCH_ROCM_ARCH}" | grep -q "gfx90a"; then \
-        TARGET_GPUS="MI200"; \
-    elif echo "${ARG_PYTORCH_ROCM_ARCH}" | grep -q "gfx942"; then \
-        TARGET_GPUS="MI300X"; \
-    elif echo "${ARG_PYTORCH_ROCM_ARCH}" | grep -q "gfx110"; then \
-        TARGET_GPUS="Navi31"; \
-    else \
-        echo "Unsupported GPU architecture"; \
-        exit 1; \
-    fi \
-    && git clone https://github.com/ROCm/aotriton.git -b ${AOTRITON_BRANCH} aotriton_${AOTRITON_BRANCH} \
-    && cd aotriton_${AOTRITON_BRANCH} \
-    && git submodule update --init --recursive \
-    && pip install -r requirements.txt \
-    && apt update \
-    && apt install -y libzstd-dev \
-    && mkdir build \
-    && cd build \
-    && export PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:${CONDA_PREFIX}/lib/pkgconfig" \
-    && cmake .. -DCMAKE_INSTALL_PREFIX=/opt/rocm/aotriton -DCMAKE_BUILD_TYPE=Release -DAOTRITON_GPU_BUILD_TIMEOUT=0 -DTARGET_GPUS=${TARGET_GPUS} -G Ninja \
-    && ninja install
+# aotriton download and extract
+FROM base AS download_aotriton
+ARG AOTRITON_VERSION="0.7.1b"
+RUN apt-get update && apt-get install -y wget \
+    && wget https://github.com/ROCm/aotriton/releases/download/${AOTRITON_VERSION}/aotriton-${AOTRITON_VERSION}-manylinux_2_28_x86_64-rocm6.2-shared.tar.gz \
+    && mkdir -p /aotriton \
+    && tar -xzf aotriton-${AOTRITON_VERSION}-manylinux_2_28_x86_64-rocm6.2-shared.tar.gz -C /aotriton --strip-components=1
 
 FROM scratch AS export_aotriton
-COPY --from=build_aotriton /opt/rocm/aotriton/ /aotriton/
+COPY --from=download_aotriton /aotriton/ /aotriton/
 
 FROM base as build_pytorch
 ARG PYTORCH_BRANCH="release/2.4"
@@ -177,7 +159,9 @@ ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
 ARG VLLM_BRANCH="v0.6.2+rocm"
 ONBUILD RUN git clone ${VLLM_REPO} \
 	    && cd vllm \
-	    && git checkout ${VLLM_BRANCH}
+	    && git checkout ${VLLM_BRANCH} \
+        && git fetch origin pull/246/head:pr-246 \
+        && git checkout pr-246
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 # -----------------------
