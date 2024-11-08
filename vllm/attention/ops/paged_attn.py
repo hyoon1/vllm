@@ -11,7 +11,7 @@ if HAS_TRITON:
     from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
-_PARTITION_SIZE = 512 if not is_hip() else 1024
+_PARTITION_SIZE = 512
 
 
 @dataclass
