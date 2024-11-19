@@ -17,7 +17,7 @@ from vllm.transformers_utils.config import (ConfigFormat, get_config,
                                             get_hf_image_processor_config,
                                             get_hf_text_config)
 from vllm.utils import (GiB_bytes, cuda_device_count_stateless, get_cpu_memory,
-                        is_hip, is_neuron, is_openvino, is_xpu,
+                        is_hip, is_navi, is_neuron, is_openvino, is_xpu,
                         print_warning_once)
 
 if TYPE_CHECKING:
@@ -907,6 +907,12 @@ class ParallelConfig:
 
         self._verify_args()
         self.rank: int = 0
+
+        if is_navi() and self.tensor_parallel_size <= 2:
+            self.disable_custom_all_reduce = True
+            logger.info(
+                "Disabled the custom all-reduce kernel because it is not "
+                "working correctly when using two AMD Navi GPUs.")
 
     @property
     def use_ray(self) -> bool:

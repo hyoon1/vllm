@@ -408,6 +408,14 @@ def is_hip() -> bool:
 
 
 @lru_cache(maxsize=None)
+def is_navi() -> bool:
+    if not is_hip() or not torch.cuda.is_available():
+        return False
+    archName = torch.cuda.get_device_properties('cuda').gcnArchName
+    return archName is not None and "gfx1" in archName
+
+
+@lru_cache(maxsize=None)
 def is_cpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
     try:
