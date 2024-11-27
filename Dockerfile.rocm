@@ -1,14 +1,13 @@
 # default base image
-ARG BASE_IMAGE="rocm/pytorch:rocm6.2_ubuntu20.04_py3.9_pytorch_release_2.3.0"
+ARG BASE_IMAGE="rocm/pytorch:rocm6.2.3_ubuntu22.04_py3.10_pytorch_release_2.3.0"
 
 ARG COMMON_WORKDIR=/app
 
 # The following ARGs should be "0" or "1". If "1", the respective component will be built and installed on top of the base image
 ARG BUILD_HIPBLASLT="0"
-ARG BUILD_RCCL="1"
-ARG BUILD_FA="1"
+ARG BUILD_RCCL="0"
+ARG BUILD_FA="0"
 ARG BUILD_TRITON="1"
-ARG BUILD_PYTORCH="1"
 # This ARG should also be "0" or "1". If "1", the vLLM development directory is obtained via git clone.
 # If "0", it is copied in from the local working directory.
 ARG REMOTE_VLLM="0"
@@ -23,7 +22,7 @@ USER root
 ARG BASE_IMAGE
 ARG COMMON_WORKDIR
 # Used as ARCHes for all components
-ARG ARG_PYTORCH_ROCM_ARCH="gfx90a;gfx942"
+ARG ARG_PYTORCH_ROCM_ARCH="gfx1100"
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH}
 
 # Install some basic utilities
@@ -31,10 +30,21 @@ RUN apt-get update -q -y && apt-get install -q -y python3 python3-pip
 RUN apt-get update -q -y && apt-get install -q -y \
     sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev
 
+# Remove sccache
+RUN python3 -m pip install --upgrade pip
+RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
+
+# Install torch == 2.5.0 on ROCm
+RUN python3 -m pip uninstall -y torch torchvision \
+    && python3 -m pip install --no-cache-dir \
+        torch==2.5.0 \
+        torchvision==0.20.0 \
+        --index-url https://download.pytorch.org/whl/rocm6.2
+
 ENV LLVM_SYMBOLIZER_PATH=/opt/rocm/llvm/bin/llvm-symbolizer
-ENV PATH=$PATH:/opt/rocm/bin:/opt/conda/envs/py_3.9/lib/python3.9/site-packages/torch/bin:
-ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/rocm/lib/:/opt/conda/envs/py_3.9/lib/python3.9/site-packages/torch/lib:
-ENV CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/opt/conda/envs/py_3.9/lib/python3.9/site-packages/torch/include:/opt/conda/envs/py_3.9/lib/python3.9/site-packages/torch/include/torch/csrc/api/include/:/opt/rocm/include/:
+ENV PATH=$PATH:/opt/rocm/bin:/opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/bin:
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/rocm/lib/:/opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/lib:
+ENV CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/include:/opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/:/opt/rocm/include/:
 
 WORKDIR ${COMMON_WORKDIR}
 
@@ -108,60 +118,16 @@ RUN cd /opt/rocm/share/amd_smi \
 FROM scratch AS export_amdsmi
 COPY --from=build_amdsmi /opt/rocm/share/amd_smi/dist/*.whl /
 
-# aotriton download and extract
-FROM base AS download_aotriton
-ARG AOTRITON_VERSION="0.7.1b"
-RUN apt-get update && apt-get install -y wget \
-    && wget https://github.com/ROCm/aotriton/releases/download/${AOTRITON_VERSION}/aotriton-${AOTRITON_VERSION}-manylinux_2_28_x86_64-rocm6.2-shared.tar.gz \
-    && mkdir -p /aotriton \
-    && tar -xzf aotriton-${AOTRITON_VERSION}-manylinux_2_28_x86_64-rocm6.2-shared.tar.gz -C /aotriton --strip-components=1
-
-FROM scratch AS export_aotriton
-COPY --from=download_aotriton /aotriton/ /aotriton/
-
-FROM base as build_pytorch
-ARG PYTORCH_BRANCH="release/2.5"
-ARG PYTORCH_VISION_BRANCH="v0.20.0"
-ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
-ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
-#RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
-#if ls /install/*.deb; then \
-#    apt-get purge -y hipblaslt \
-#    && dpkg -i /install/*.deb \
-#    && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
-#    && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status; \
-#fi
-# Install aotriton
-COPY --from=export_aotriton /aotriton/ /opt/rocm/aotriton/
-
-RUN git clone ${PYTORCH_REPO} pytorch \
-    && cd pytorch && git checkout ${PYTORCH_BRANCH} && git submodule update --init --recursive \
-    && python tools/amd_build/build_amd.py \
-    && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist \
-    && pip install dist/*.whl \
-    && cd .. \
-    && git clone ${PYTORCH_VISION_REPO} vision \
-    && cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
-    && python3 setup.py bdist_wheel --dist-dir=dist
-FROM scratch as export_pytorch_1
-ARG COMMON_WORKDIR
-COPY --from=build_pytorch ${COMMON_WORKDIR}/pytorch/dist/*.whl /
-COPY --from=build_pytorch ${COMMON_WORKDIR}/vision/dist/*.whl /
-FROM scratch as export_pytorch_0
-from export_pytorch_${BUILD_PYTORCH} as export_pytorch
-
 # -----------------------
 # vLLM (and gradlib) fetch stages
 FROM base AS fetch_vllm_0
 ONBUILD COPY ./ vllm/
 FROM base AS fetch_vllm_1
-ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
-ARG VLLM_BRANCH="v0.6.2+rocm"
+ARG VLLM_REPO="https://github.com/hyoon1/vllm.git"
+ARG VLLM_BRANCH="v0.6.2+torch2.5"
 ONBUILD RUN git clone ${VLLM_REPO} \
 	    && cd vllm \
-	    && git checkout ${VLLM_BRANCH} \
-        && git fetch origin pull/246/head:pr-246 \
-        && git checkout pr-246
+	    && git checkout ${VLLM_BRANCH}
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 # -----------------------
@@ -169,9 +135,6 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 FROM fetch_vllm AS build_vllm
 ARG COMMON_WORKDIR
 ARG USE_CYTHON
-# Install aotriton
-RUN --mount=type=bind,from=export_aotriton,src=/aotriton,target=/install/aotriton \
-    cp -r /install/aotriton/* /opt/rocm/aotriton/
 # Install hipblaslt
 RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
 if ls /install/*.deb; then \
@@ -180,18 +143,13 @@ if ls /install/*.deb; then \
     && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
     && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status; \
 fi
-# Install pytorch
-RUN --mount=type=bind,from=export_pytorch,src=/,target=/install \
-if ls /install/*.whl; then \
-    pip install /install/*.whl; \
-fi
 
 # Build vLLM
 RUN cd vllm \
     && python3 -m pip install -r requirements-rocm.txt \
     && python3 setup.py clean --all  \
     && if [ ${USE_CYTHON} -eq "1" ]; then python3 setup_cython.py build_ext --inplace; fi \
-    && SCCACHE_IDLE_TIMEOUT=1800 python3 setup.py bdist_wheel --dist-dir=dist
+    && python3 setup.py bdist_wheel --dist-dir=dist
 # Build gradlib
 RUN cd vllm/gradlib \
     && python3 setup.py clean --all && python3 setup.py bdist_wheel --dist-dir=dist
@@ -217,12 +175,9 @@ RUN python3 -m pip install --upgrade pip && rm -rf /var/lib/apt/lists/*
 # Error related to odd state for numpy 1.20.3 where there is no METADATA etc, but an extra LICENSES_bundled.txt.
 # Manually remove it so that later steps of numpy upgrade can continue
 RUN case "$(which python3)" in \
-        *"/opt/conda/envs/py_3.9"*) \
-            rm -rf /opt/conda/envs/py_3.9/lib/python3.9/site-packages/numpy-1.20.3.dist-info/;; \
+        *"/opt/conda/envs/py_3.10"*) \
+            rm -rf /opt/conda/envs/py_3.10/lib/python3.10/site-packages/numpy-1.20.3.dist-info/;; \
         *) ;; esac
-
-RUN --mount=type=bind,from=export_aotriton,src=/aotriton,target=/install/aotriton \
-cp -r /install/aotriton/* /opt/rocm/aotriton/
 
 RUN --mount=type=bind,from=export_hipblaslt,src=/,target=/install \
     if ls /install/*.deb; then \
@@ -259,13 +214,6 @@ RUN --mount=type=bind,from=export_amdsmi,src=/,target=/install \
     # Preemptively uninstall to prevent pip same-version no-installs
     pip uninstall -y amdsmi \
     && pip install /install/*.whl;
-
-RUN --mount=type=bind,from=export_pytorch,src=/,target=/install \
-    if ls /install/*.whl; then \
-        # Preemptively uninstall to prevent pip same-version no-installs
-        pip uninstall -y torch torchvision \
-        && pip install /install/*.whl; \
-    fi
 
 RUN python3 -m pip install --upgrade numba scipy huggingface-hub[cli]
 
