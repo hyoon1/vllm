@@ -308,7 +308,7 @@ def get_cdna_autotune_configs():
         #     num_stages=1,
         #     num_warps=4,
         # ),
-    ], ['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL', 'USE_FP8'],
+    ], ['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL', 'USE_FP8']
 
 
 def get_rdna_autotune_configs():
@@ -349,35 +349,36 @@ def get_rdna_autotune_configs():
             },
             num_stages=1,
             num_warps=2),
-        triton.Config(
-            {
-                'BLOCK_M': 16,
-                'BLOCK_N': 16,
-                'waves_per_eu': 4,
-                'PRE_LOAD_V': False
-            },
-            num_stages=1,
-            num_warps=2),
-        triton.Config(
-            {
-                'BLOCK_M': 16,
-                'BLOCK_N': 16,
-                'waves_per_eu': 2,
-                'PRE_LOAD_V': False
-            },
-            num_stages=1,
-            num_warps=2),
-        # Fall-back config.
-        triton.Config(
-            {
-                'BLOCK_M': 16,
-                'BLOCK_N': 16,
-                'waves_per_eu': 1,
-                'PRE_LOAD_V': False
-            },
-            num_stages=1,
-            num_warps=2),
-    ], ['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL']
+        # Fails in AccelerateAMDMatmul (Triton) assert when using FP8:
+        # triton.Config(
+        #     {
+        #         'BLOCK_M': 16,
+        #         'BLOCK_N': 16,
+        #         'waves_per_eu': 4,
+        #         'PRE_LOAD_V': False
+        #     },
+        #     num_stages=1,
+        #     num_warps=2),
+        # triton.Config(
+        #     {
+        #         'BLOCK_M': 16,
+        #         'BLOCK_N': 16,
+        #         'waves_per_eu': 2,
+        #         'PRE_LOAD_V': False
+        #     },
+        #     num_stages=1,
+        #     num_warps=2),
+        # # Fall-back config.
+        # triton.Config(
+        #     {
+        #         'BLOCK_M': 16,
+        #         'BLOCK_N': 16,
+        #         'waves_per_eu': 1,
+        #         'PRE_LOAD_V': False
+        #     },
+        #     num_stages=1,
+        #     num_warps=2),
+    ], ['IS_CAUSAL', 'dropout_p', 'BLOCK_DMODEL', 'USE_FP8']
 
 
 def get_autotune_configs():
