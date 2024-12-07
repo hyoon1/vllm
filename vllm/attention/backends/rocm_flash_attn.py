@@ -338,7 +338,7 @@ def _make_alibi_bias(alibi_slopes: torch.Tensor,
 
 def _get_seq_len_block_table_args(
     attn_metadata: ROCmFlashAttentionMetadata,
-    attn_type: AttentionType,
+    attn_type: str,
 ) -> tuple:
     '''
     The particular choice of sequence-length
@@ -468,10 +468,13 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         if blocksparse_params is not None:
             raise ValueError(
                 "ROCmFlashAttention does not support blocksparse attention.")
-        if logits_soft_cap is not None:
-            raise ValueError(
-                "ROCmFlashAttention does not support attention logits soft "
-                "capping.")
+
+        if logits_soft_cap is None:
+            # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
+            self.logits_soft_cap = 0.0
+        else:
+            self.logits_soft_cap = logits_soft_cap
+
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -496,6 +499,14 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         # NOTE: Allow for switching between Triton and CK. Defaulting to triton.
         self.use_triton_flash_attn = envs.VLLM_USE_TRITON_FLASH_ATTN
         if self.use_triton_flash_attn:
+            if logits_soft_cap is not None:
+                raise ValueError(
+                    "ROCm Triton FlashAttention does not support attention"
+                    "logits soft capping."
+                    " please try using the ROCm CK "
+                    "FA backend instead by setting the env var "
+                    "`VLLM_USE_TRITON_FLASH_ATTN=0`")
+
             from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
                 triton_attention)
             self.attn_func = triton_attention
@@ -522,6 +533,11 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     self.use_naive_attn = True
 
             if self.use_naive_attn:
+                if logits_soft_cap is not None:
+                    raise ValueError(
+                        "ROCm Naive FlashAttention does not support"
+                        "attention logits soft capping.")
+
                 self.attn_func = _sdpa_attention
                 logger.debug("Using naive (SDPA) attention in ROCmBackend")
 
@@ -542,7 +558,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         attn_metadata: ROCmFlashAttentionMetadata,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        attn_type: AttentionType = AttentionType.DECODER,
+        attn_type: str = AttentionType.DECODER,
+        output: Optional[torch.Tensor] = None,
         fp8_out_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
@@ -686,6 +703,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         self.scale,
                         attn_masks[0][None]
                         if attn_masks is not None else None,
+                        None,
                     )
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
@@ -746,6 +764,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             causal=True,
                             window_size=self.sliding_window,
                             alibi_slopes=self.alibi_slopes,
+                            softcap=self.logits_soft_cap,
                         )
 
                 # common code for prefill
