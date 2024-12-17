@@ -14,6 +14,7 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils import is_navi3
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -522,15 +523,12 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             # either
             if not current_platform.has_device_capability(90):
                 self.use_naive_attn = True
+            elif flash_attn_available:
+                self.attn_func = (flash_attn_varlen_func
+                                  if not is_navi3() else _ck_attention)
+                logger.debug("Using CK FA in ROCmBackend")
             else:
-                if flash_attn_available:
-                    if current_platform.has_device_capability(110):
-                        self.attn_func = _ck_attention
-                    else:
-                        self.attn_func = flash_attn_varlen_func
-                    logger.debug("Using CK FA in ROCmBackend")
-                else:
-                    self.use_naive_attn = True
+                self.use_naive_attn = True
 
             if self.use_naive_attn:
                 if logits_soft_cap is not None:
@@ -733,7 +731,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         attn_masks,
                     )
                 else:
-                    if _ON_NAVI:
+                    if is_navi3():
                         query = query.view(
                             (num_prefill_tokens, self.num_heads, -1))
                         key = key.view(
