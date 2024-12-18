@@ -29,6 +29,8 @@
   #define __HIP__MI300_MI250__
 #endif
 
+#define __HIP__MI300_MI250__
+
 #if defined(NDEBUG)
   #undef NDEBUG
   #include <assert.h>
@@ -48,8 +50,11 @@
   #define GCN_MFMA_INSTR __builtin_amdgcn_mfma_f32_4x4x4f16
 
 using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+using floatx8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 using float16x4 =
     __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
+using float16x16 =
+    __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;    
 typedef float16x4 _Half4;
 typedef struct _Half8 {
   _Half4 xy[2];
@@ -57,10 +62,12 @@ typedef struct _Half8 {
 
 using bit16_t = uint16_t;
 using bit16x4 = __attribute__((__vector_size__(4 * sizeof(uint16_t)))) uint16_t;
+using bit16x16 = __attribute__((__vector_size__(16 * sizeof(uint16_t)))) uint16_t;
 typedef bit16x4 _B16x4;
 typedef struct _B16x8 {
   _B16x4 xy[2];
 } _B16x8;
+typedef bit16x16 _B16x16;
 
 using _B8x8 = uint2;
 using bit8_t = uint8_t;
@@ -93,15 +100,13 @@ __device__ __forceinline__ floatx4 gcn_mfma_instr(const _B16x4& inpA,
 }
 
 template <typename T, int absz, int cbid, int blgp>
-__device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
-                                                  const _B16x4& inpB,
-                                                  const floatx4& inpC) {
+__device__ __forceinline__ floatx4 gcn_wmma16x16x16_instr(const _B16x16& inpA,
+                                                  const _B16x16& inpB,
+                                                  const floatx8& inpC) {
   if constexpr (std::is_same<T, _Float16>::value) {
-    return __builtin_amdgcn_mfma_f32_16x16x16f16(inpA, inpB, inpC, absz, cbid,
-                                              blgp);
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(inpA, inpB, inpC);
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-    return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(inpA, inpB, inpC, absz, cbid,
-                                                  blgp);
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(inpA, inpB, inpC);
   } else {
     static_assert(false, "unsupported 16b dtype");
   }
@@ -368,13 +373,13 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
   __shared__ _B16x4 shared_logits[NWARPS][4][16][4 + 1];
     
   //for QK mfma16x16, layout is QHead/Tokenx16 across every 16 lanes, 16 Bytes HeadElements in each lane, 4x16B HeadElements across 4 rows of warp
-  constexpr int ROWS_PER_WARP = WARP_SIZE / 16; //rows refers to 16 lanes; refer dpp terminology
+  constexpr int ROWS_PER_WARP = WARP_SIZE / 16; //2 rows refers to 16 lanes; refer dpp terminology
   constexpr int CONTIGUOUS_KV_ELEMS_16B_LOAD = 16 / sizeof(cache_t); //8 for 16 bit cache type, 16 for 8 bit types
-  constexpr int QKHE_PER_FETCH = CONTIGUOUS_KV_ELEMS_16B_LOAD * ROWS_PER_WARP; //each fetch across a warp fetches these many elements
+  constexpr int QKHE_PER_FETCH = CONTIGUOUS_KV_ELEMS_16B_LOAD * ROWS_PER_WARP; //16 each fetch across a warp fetches these many elements
   constexpr int QK_SIZE_RATIO = sizeof(scalar_t) / sizeof(cache_t); //1 for 16bit types, 2 for 8bit types
-  constexpr int QKHELOOP = HEAD_SIZE / QKHE_PER_FETCH; //4xQKHE_16B across warp
+  constexpr int QKHELOOP = HEAD_SIZE / QKHE_PER_FETCH; //8 4xQKHE_16B across warp
 
-  _B16x8 Qlocal[QKHELOOP][QK_SIZE_RATIO]; //note that 16 contiguous elements of Q should be fetched per lane for 8 bit cache types : QK_SIZE_RATIO changes for this
+  _B16x16 Qlocal[QKHELOOP][QK_SIZE_RATIO]; //note that 16 contiguous elements of Q should be fetched per lane for 8 bit cache types : QK_SIZE_RATIO changes for this
 
   constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 16 / sizeof(scalar_t);
   //constexpr int x = CONTIGUOUS_SCALAR_ELEMS_16B; //x is defined by vLLM as 16Bytes
@@ -383,10 +388,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
   //constexpr int TLOOP1 = CONTIGUOUS_KV_ELEMS_16B_LOAD / 4; //mfma16x16x16 outputs 4 elements per lane: will be moved to match layout for V dwordx4 loads  
   //constexpr int TOKENS_PER_WARP1 = 16 * TLOOP1; //16 tokens across lanes * TLOOP factor
   //constexpr int T_PAR_LOOP = T_PAR_SIZE / TOKENS_PER_WARP1 / NWARPS; 
-  constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS; //sub partition of tokens per warp for qk calculation
-  constexpr int TLOOP = TOKENS_PER_WARP / 16; //each mfma16x16x16 instruction processes 16 tokens 
+  constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS; //64 sub partition of tokens per warp for qk calculation
+  constexpr int TLOOP = TOKENS_PER_WARP / 16; //4 each mfma16x16x16 instruction processes 16 tokens 
 
-  _B16x8 Klocal[TLOOP][QKHELOOP]; //this could be B8x16 too
+  _B16x16 Klocal[TLOOP][QKHELOOP]; //this could be B8x16 too
 
   const int wg_start_head_idx = blockIdx.z * GQA_RATIO;
   const int wg_start_kv_head_idx = blockIdx.z;
@@ -550,7 +555,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
 
 #else //Q in shared
-    _B16x4 tmpQ[QKHELOOP][2];
+    _B16x4 tmpQ[QKHELOOP][2]; 
     for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
         tmpQ[qkhe_depth][0] = shared_logits[qkhe_depth][rowid][lane16id][0];
         tmpQ[qkhe_depth][1] = shared_logits[qkhe_depth][rowid][lane16id][1];
