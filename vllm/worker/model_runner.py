@@ -1532,6 +1532,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         ModelInputForGPUWithSamplingMetadata)
     _builder_cls: Type[ModelInputForGPUBuilder] = ModelInputForGPUBuilder
 
+    # Static variables to keep count
+    decode_step_count = 0
+    prefill_step_count = 0
+
     def make_model_input_from_broadcasted_tensor_dict(
         self,
         tensor_dict: Dict[str, Any],
@@ -1620,8 +1624,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
+            ModelRunner.decode_step_count += 1
+            logger.info("DECODE STEP %d", ModelRunner.decode_step_count)
+        elif prefill_meta is None and not decode_meta.use_cuda_graph:
+            model_executable = self.model
+            ModelRunner.decode_step_count += 1
+            logger.info("DECODE STEP %d", ModelRunner.decode_step_count)
         else:
             model_executable = self.model
+            ModelRunner.prefill_step_count += 1
+            logger.info("PREFILL STEP %d", ModelRunner.prefill_step_count)
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
