@@ -36,6 +36,7 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 # vLLM build stages
 FROM fetch_vllm AS build_vllm
 ARG USE_CYTHON
+ENV VLLM_TARGET_DEVICE="rocm"
 # Build vLLM
 RUN cd vllm \
     && python3 -m pip install -r requirements-rocm.txt \
