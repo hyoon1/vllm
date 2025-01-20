@@ -36,7 +36,10 @@ def main(
                         head_size,
                         dtype=dtype,
                         device=device)
-    query.uniform_(-scale, scale)
+    print("[query_shape]: ", query.shape)
+    #query.uniform_(-scale, scale)
+    query.fill_(1.0)
+    print(query)
 
     assert num_query_heads % num_kv_heads == 0
     alibi_slopes = None
@@ -102,7 +105,7 @@ def main(
         # Using default kv_scale
         k_scale = v_scale = 0.1
 
-        for _ in range(num_iters):
+        for i in range(num_iters):
             if version == "v1":
                 ops.paged_attention_v1(
                     output,
@@ -142,6 +145,7 @@ def main(
                         v_scale,
                     )
                 else:
+                    print(f"call paged_attention_rocm: {i}")
                     ops.paged_attention_rocm(
                         output,
                         exp_sums,
@@ -173,15 +177,15 @@ def main(
         return (end_time - start_time) / num_iters
 
     # Warmup.
-    print("Warming up...")
+    #print("Warming up...")
     run_benchmark = run_cuda_benchmark
-    run_benchmark(num_iters=3, profile=False)
+    #run_benchmark(num_iters=3, profile=False)
 
     # Benchmark.
     if do_profile:
         latency = run_benchmark(num_iters=1, profile=True)
     else:
-        latency = run_benchmark(num_iters=10000, profile=False)
+        latency = run_benchmark(num_iters=1, profile=False)
     print(f"Kernel running time: {latency * 1000000:.3f} us")
 
 

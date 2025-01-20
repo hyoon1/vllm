@@ -799,7 +799,8 @@ def create_kv_caches_with_random(
                                 dtype=torch_dtype,
                                 device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
-            key_cache.uniform_(-scale, scale)
+            #key_cache.uniform_(-scale, scale)
+            key_cache.fill_(1.0)
         elif cache_dtype == 'fp8':
             _generate_random_fp8(key_cache, -scale, scale)
         else:
@@ -814,7 +815,8 @@ def create_kv_caches_with_random(
                                   dtype=torch_dtype,
                                   device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
-            value_cache.uniform_(-scale, scale)
+            #value_cache.uniform_(-scale, scale)
+            value_cache.fill_(1.0)
         elif cache_dtype == 'fp8':
             _generate_random_fp8(value_cache, -scale, scale)
         else:

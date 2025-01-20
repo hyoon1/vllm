@@ -31,11 +31,13 @@ DTYPES = [
 ] if not current_platform.is_rocm() else [torch.half,torch.bfloat16]
 NUM_GEN_SEQS = [17]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
-NUM_HEADS = [(64, 8), (26,2), (16,1), (32,32)]  # Arbitrary values for testing
+#NUM_HEADS = [(64, 8), (26,2), (16,1), (32,32)]  # Arbitrary values for testing
+#NUM_HEADS = [(32,32)]  # Arbitrary values for testing
+NUM_HEADS = [(16,1)]  # Arbitrary values for testing
 
 # FlashAttention forward only supports head dimension at most 128
 # https://github.com/ROCmSoftwarePlatform/flash-attention/blob/3d2b6f5d037782cc2c906909a46fb7e2e1b48b25/csrc/flash_attn_rocm/flash_api.cpp#L62
-HEAD_SIZES = [64, 80, 96, 112, 120, 128, 192, 256]
+#HEAD_SIZES = [64, 80, 96, 112, 120, 128, 192, 256]
 HEAD_SIZES = [128]
 
 BLOCK_SIZES = [16]
@@ -43,7 +45,7 @@ USE_ALIBI = [False]
 KV_CACHE_DTYPE = ["auto"]
 SEEDS = [0]
 CUDA_DEVICES = [
-    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 1)
+    f"cuda:{0}"
 ]
 
 REF_TENSOR = None

@@ -497,6 +497,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/fused_kernels.cu"
     "csrc/rocm/custom.cu")
 
+  list(APPEND VLLM_GPU_FLAGS "-ggdb")
+  list(APPEND VLLM_GPU_FLAGS "-O0")
+
   define_gpu_extension_target(
     _rocm_C
     DESTINATION vllm
