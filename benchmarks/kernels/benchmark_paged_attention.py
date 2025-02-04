@@ -36,10 +36,16 @@ def main(
                         head_size,
                         dtype=dtype,
                         device=device)
-    print("[query_shape]: ", query.shape)
-    #query.uniform_(-scale, scale)
-    query.fill_(1.0)
-    print(query)
+    #print("[query_shape]: ", query.shape)
+    query.uniform_(-scale, scale)
+    #query.fill_(1.0)
+    #query = torch.arange(
+    #    num_seqs * num_query_heads * head_size,
+    #    dtype=dtype,
+    #    device=device
+    #).reshape(query.shape) / 1000000.0
+
+    #print(query)
 
     assert num_query_heads % num_kv_heads == 0
     alibi_slopes = None
@@ -145,7 +151,7 @@ def main(
                         v_scale,
                     )
                 else:
-                    print(f"call paged_attention_rocm: {i}")
+                    #print(f"call paged_attention_rocm: {i}")
                     ops.paged_attention_rocm(
                         output,
                         exp_sums,

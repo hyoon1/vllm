@@ -768,6 +768,40 @@ def create_kv_caches_with_random_flash(
         value_caches.append(key_value_cache[:, 1])
     return key_caches, value_caches
 
+def save_caches(key_caches, value_caches, save_dir="./cache_dumps"):
+    """Save key and value caches to .npy files with type conversion if needed"""
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save key caches
+    for i, key_cache in enumerate(key_caches):
+        # Convert BFloat16 to float32 before saving
+        key_np = key_cache.cpu().float().numpy()
+        np.save(os.path.join(save_dir, f"key_cache_layer_{i}.npy"), key_np)
+
+    # Save value caches
+    for i, value_cache in enumerate(value_caches):
+        # Convert BFloat16 to float32 before saving
+        value_np = value_cache.cpu().float().numpy()
+        np.save(os.path.join(save_dir, f"value_cache_layer_{i}.npy"), value_np)
+
+def load_kv_caches(load_dir="./cache_dumps", device="cuda", dtype=torch.bfloat16) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Load key and value caches from .npy files with type conversion"""
+    key_caches = []
+    value_caches = []
+
+    layer_count = len([f for f in os.listdir(load_dir) if f.startswith("key_cache_layer_")])
+
+    for i in range(layer_count):
+        # Load and convert to specified dtype
+        key_np = np.load(os.path.join(load_dir, f"key_cache_layer_{i}.npy"))
+        key_tensor = torch.from_numpy(key_np).to(device).to(dtype)
+        key_caches.append(key_tensor)
+
+        value_np = np.load(os.path.join(load_dir, f"value_cache_layer_{i}.npy"))
+        value_tensor = torch.from_numpy(value_np).to(device).to(dtype)
+        value_caches.append(value_tensor)
+
+    return key_caches, value_caches
 
 def create_kv_caches_with_random(
     num_blocks: int,
@@ -787,6 +821,7 @@ def create_kv_caches_with_random(
         )
 
     current_platform.seed_everything(seed)
+    #torch.manual_seed(42)
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
@@ -794,13 +829,20 @@ def create_kv_caches_with_random(
     x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     key_caches: List[torch.Tensor] = []
-    for _ in range(num_layers):
+    for i in range(num_layers):
+        #offset_k = i * 10000
         key_cache = torch.empty(size=key_cache_shape,
                                 dtype=torch_dtype,
                                 device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
-            #key_cache.uniform_(-scale, scale)
-            key_cache.fill_(1.0)
+            key_cache.uniform_(-scale, scale)
+            #key_cache.fill_(1.0)
+            #key_cache = torch.arange(
+            #    start=offset_k,
+            #    end =offset_k + num_blocks * num_heads * (head_size // x) * block_size * x,
+            #    dtype=torch_dtype,
+            #    device=device
+            #).reshape(key_cache_shape) / (1000000.0)
         elif cache_dtype == 'fp8':
             _generate_random_fp8(key_cache, -scale, scale)
         else:
@@ -810,19 +852,31 @@ def create_kv_caches_with_random(
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
     value_caches: List[torch.Tensor] = []
-    for _ in range(num_layers):
+    for i in range(num_layers):
+        #offset_v = i * 5000
         value_cache = torch.empty(size=value_cache_shape,
                                   dtype=torch_dtype,
                                   device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
-            #value_cache.uniform_(-scale, scale)
-            value_cache.fill_(1.0)
+            value_cache.uniform_(-scale, scale)
+            #value_cache.fill_(2.0)
+            #value_cache = torch.arange(
+            #    start=offset_v,
+            #    end=offset_v + num_blocks * num_heads * head_size * block_size * 0.5,
+            #    step=0.5,
+            #    dtype=torch_dtype,
+            #    device=device
+            #).reshape(value_cache_shape) / (1000000.0)  # Scale down the values
         elif cache_dtype == 'fp8':
             _generate_random_fp8(value_cache, -scale, scale)
         else:
             raise ValueError(
                 f"Does not support value cache of type {cache_dtype}")
         value_caches.append(value_cache)
+
+    #save_caches(key_caches, value_caches)
+    #key_caches, value_caches = load_kv_caches(dtype=torch.bfloat16)
+
     return key_caches, value_caches
 
 

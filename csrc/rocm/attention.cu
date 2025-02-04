@@ -506,7 +506,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
 
     constexpr int VTOKENS_PER_LANE = 16;
-    constexpr int VTLOOP = NWARPS; //was * TOKENS_PER_WARP / ROWS_PER_WARP / VTOKENS_PER_LANE; 
+    constexpr int VTLOOP = NWARPS; //was * TOKENS_PER_WARP / ROWS_PER_WARP / VTOKENS_PER_LANE;
     constexpr int VTLANELOOP = VTOKENS_PER_LANE / CONTIGUOUS_KV_ELEMS_16B_LOAD; //optimized for 16B fetches; assumes minimum block size is 16
     constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS;
     int vphysical_block_number[VTLOOP];
@@ -2187,7 +2187,22 @@ __device__ void printHalfVector(bit16x16 vec) {
 __device__ void printBfloat16Vector(bit16x16 vec) {
     for (int i = 0; i < 16; ++i) {
         float f = __bfloat162float(__ushort_as_bfloat16(vec[i]));
-        printf("[%d]: %f ", i, f);
+        printf("tid=%d [%d]: %f\n", threadIdx.x, i, f);
+    }
+    printf("\n");
+}
+
+__device__ void printBfloat8Vector(_B16x8 vec) {
+    for (int i = 0; i < 8; ++i) {
+        float f = __bfloat162float(__ushort_as_bfloat16(vec.xy[i/4][i]));
+        printf("tid=%d [%d]: %f\n", threadIdx.x, i, f);
+    }
+    printf("\n");
+}
+
+__device__ void printFloat8Vector(floatx8 vec) {
+    for (int i = 0; i < 8; ++i) {
+        printf("tid=%d [%d]: %f\n", threadIdx.x, i, vec[i]);
     }
     printf("\n");
 }
@@ -2239,12 +2254,14 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
   }
   //printf("warpid=%d laneid=%d seq_idx=%d partition_idx=%d partition_start_token_idx=%d\n",warpid, laneid, seq_idx, partition_idx, partition_start_token_idx);
 
-  constexpr int GQA_RATIO4 = DIVIDE_ROUND_UP(GQA_RATIO,4); // GQA_RATIO=8
+  constexpr int GQA_RATIO8 = DIVIDE_ROUND_UP(GQA_RATIO,8);
+  constexpr int GQA_RATIO4 = DIVIDE_ROUND_UP(GQA_RATIO,4);
+  constexpr int GQA_RATIO2 = DIVIDE_ROUND_UP(GQA_RATIO,2);
 
   __shared__ float shared_qk_max[NWARPS][16 + 1];
   __shared__ float shared_exp_sum[NWARPS][16 + 1];
   //shared_logits is used for multiple purposes
-  //__shared__ _B16x16 shared_logits[NWARPS][4][16];
+  //__shared__ _B16x16 shared_logits[NWARPS][4][16][2];
     
   // for QK wmma16x16, layout is QHead/Tokenx16 across every 16 lanes,
   // 16 Bytes HeadElements in each lane, 4x16B HeadElements across 4 rows of warp
@@ -2267,8 +2284,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
   constexpr int T_PAR_SIZE = 256; //partition size set to 256 TODO move to template param
   constexpr int T_PAR_LOOP = T_PAR_SIZE / TOKENS_PER_WARP1 / NWARPS; //2 256/16/8
   constexpr int TLOOP = TLOOP1 * T_PAR_LOOP; //2
-  constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS; //32 //TOKENS_PER_WARP1 * T_PAR_LOOP; //sub partition of tokens per warp for qk calculation
+  constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS; //32 256/8//TOKENS_PER_WARP1 * T_PAR_LOOP; //sub partition of tokens per warp for qk calculation
   //constexpr int TLOOP = TOKENS_PER_WARP / 16; //each mfma16x16x16 instruction processes 16 tokens 
+
+  __shared__ _B16x16 shared_logits[NWARPS][TLOOP][16][2];
 
   _B16x16 Klocal[TLOOP][QKHELOOP]; //this could be B8x16 too
 
@@ -2290,10 +2309,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     int kphysical_block_number[TLOOP];
 
     // printf("warpid=%d laneid=%d seq_idx=%d partition_idx=%d partition_start_token_idx=%d\n",warpid, laneid, seq_idx, partition_idx, partition_start_token_idx);
-    if (warpid == 0 && laneid == 0) {
-        printf("warpid=%d laneid=%d seq_idx=%d partition_idx=%d partition_start_token_idx=%d\n",warpid, laneid, seq_idx, partition_idx, partition_start_token_idx);
-        printf("[DEBUG] custom kernel launched\n");
-    }
+    //if (warpid == 0 && laneid == 0) {
+    //    printf("warpid=%d laneid=%d seq_idx=%d partition_idx=%d partition_start_token_idx=%d\n",warpid, laneid, seq_idx, partition_idx, partition_start_token_idx);
+    //    printf("[DEBUG] custom kernel launched\n");
+    //}
 
     //fetch k physical block numbers
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
@@ -2304,6 +2323,38 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                               : last_ctx_block;
       kphysical_block_number[token_depth] = block_table_seq[kblock_idx];
     }
+
+//    //fetch Q in shared across warps and then write to registers
+//    const int local_qhead_idx = 2 * warpid + rowid;
+//    const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
+//    const int64_t seq_idx64 = static_cast<int64_t>(seq_idx);
+//    const scalar_t* q_ptr = q + seq_idx64 * q_stride + global_qhead_idx * HEAD_SIZE;
+//
+//    const int qhead_element = lane16id * CONTIGUOUS_SCALAR_ELEMS_16B;
+//    if ( (local_qhead_idx < GQA_RATIO) && (qhead_element<HEAD_SIZE) ) {
+//        const scalar_t* q_fetch_ptr = q_ptr + qhead_element; 
+//        const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
+//        _B16x8 tmp = *q_fetch_ptr_16B; 
+//        if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
+//            const int offset1 = lane16id/4; //16 contiguous chunks of head elems are spread across 4x4lanes
+//            shared_logits[offset1][lane4id][local_qhead_idx][0] = tmp.xy[0];
+//            shared_logits[offset1][lane4id][local_qhead_idx][1] = tmp.xy[1];
+//        } else {
+//            const int head_elem = lane16id * 8;
+//            const int offset3 = head_elem % 4;
+//            const int offset2 = (head_elem / 4) % 4;
+//            const int offset1 = head_elem /4/4;
+//            shared_logits[offset1][offset2][local_qhead_idx][offset3] = tmp.xy[i];
+//        }
+//    } 
+//    __syncthreads();
+//    for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
+//        for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
+//            for (int i=0; i<2; i++) {
+//                Qlocal[qkhe_depth][qkratio].xy[i] = shared_logits[qkhe_depth][rowid][lane16id % GQA_RATIO][2*qkratio + i];
+//            }
+//        }
+//    }
 
     const int local_qhead_idx = lane16id % GQA_RATIO;
     const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
@@ -2322,7 +2373,14 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         }
     }
 
-    constexpr int KX = 16 / sizeof(cache_t);
+    //if (warpid == 0 && laneid == 0) {
+    //    for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
+    //        printf("[Qlocal] qkhe_depth: %d\n", qkhe_depth);
+    //        printBfloat16Vector(Qlocal[qkhe_depth]);
+    //    }
+    //}
+
+    constexpr int KX = 16 / sizeof(cache_t); //8
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
 
     const int row_head_elem = (rowid/2) * CONTIGUOUS_KV_ELEMS_16B_LOAD;
@@ -2345,26 +2403,84 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
       }
     }
 
-    constexpr int VTOKENS_PER_LANE = 16;
-    constexpr int VTLOOP = NWARPS; //8 was * TOKENS_PER_WARP / ROWS_PER_WARP / VTOKENS_PER_LANE; 
-    constexpr int VTLANELOOP = VTOKENS_PER_LANE / CONTIGUOUS_KV_ELEMS_16B_LOAD; //2 optimized for 16B fetches; assumes minimum block size is 16
-    constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS; //1
-    int vphysical_block_number[VTLOOP];
+//    if (warpid == 0 && lane16id == 1) {
+//        for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
+//            printf("[Klocal] qkhe_depth: %d\n", qkhe_depth);
+//            printBfloat16Vector(Klocal[0][qkhe_depth]);
+//        }
+//    }
+
+//    constexpr int VTOKENS_PER_LANE = TOKENS_PER_WARP / ROWS_PER_WARP; //32 32/1
+//    constexpr int VTLOOP = NWARPS; //8 was * TOKENS_PER_WARP / ROWS_PER_WARP / VTOKENS_PER_LANE; 
+//    constexpr int VTLANELOOP = VTOKENS_PER_LANE / CONTIGUOUS_KV_ELEMS_16B_LOAD; //4 32/8 optimized for 16B fetches; assumes minimum block size is 16
+//    constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS; //1 128/16/8
+//
+//    int vphysical_block_number[VTLOOP];
+//
+//    //fetch v physical block numbers
+//    for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
+//      const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + (rowid/2) * VTOKENS_PER_LANE;
+//      const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
+//      const int vblock_idx = (vglobal_token_idx < context_len)
+//                              ? vglobal_token_idx / BLOCK_SIZE
+//                              : last_ctx_block;
+//      vphysical_block_number[vtoken_depth] =
+//        block_table_seq[vblock_idx];
+//    }
+//
+//    _B16x16 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; //this could be B8x16 too
+//    
+//    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride;
+//
+//    //v fetches are 16head elems across lanes x 16 tokens per lane
+//    for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+//      const int vhead_elem = vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
+//      const cache_t* v_ptr2 = v_ptr + vhead_elem * BLOCK_SIZE;
+//
+//      for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
+//          const int64_t vblock_number = static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
+//          const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
+//
+//          for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
+//              const cache_t* v_fetch_ptr = v_ptr3 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+//              const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+//              Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = from_B16x8(*v_fetch_ptr_16B);
+//              if (warpid == 0) {
+//                  printf("[Vlocal] vhe_depth:%d vtoken_depth:%d vfetch_depth:%d\n",vhe_depth, vtoken_depth, vfetch_depth);
+//                  printBfloat16Vector(Vlocal[vtoken_depth][vhe_depth][vfetch_depth]);
+//              }
+//          }
+//      }
+//    }
+
+    constexpr int VTOKENS_PER_LANE = TOKENS_PER_WARP / ROWS_PER_WARP; //32 32/1 = 32 contiguous vtokens per lane
+    //constexpr int VTOKENS_PER_LANE = TOKENS_PER_WARP / 2; //32 32/1 = 32 contiguous vtokens per lane
+    constexpr int VBLOCKS_PER_LANE = 2; //assumes block size >=16, each lane can correspond to 1 block only
+    //constexpr int VBLOCKS_PER_LANE = 1; //assumes block size >=16, each lane can correspond to 1 block only
+    constexpr int VTLOOP = NWARPS; //8 corresponds to tokens across warps 
+    constexpr int VTLANELOOP = DIVIDE_ROUND_UP(VTOKENS_PER_LANE , CONTIGUOUS_KV_ELEMS_16B_LOAD); //4 32/8=4 optimized for 16B fetches; assumes minimum block size is 16
+    constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS; //1 128/16/8=1 head_size distributed across warps; each mfma instr works on 16 head elements 
+    
+    int vphysical_block_number[VTLOOP][VBLOCKS_PER_LANE];
 
     //fetch v physical block numbers
     for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
-      const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + (rowid/2) * VTOKENS_PER_LANE;
+     for (int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++) {
+      const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + (rowid/2) * VTOKENS_PER_LANE + vblock_depth * BLOCK_SIZE;
+      //const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * 2 + rowid * VTOKENS_PER_LANE + vblock_depth * BLOCK_SIZE;
       const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
       const int vblock_idx = (vglobal_token_idx < context_len)
                               ? vglobal_token_idx / BLOCK_SIZE
                               : last_ctx_block;
-      vphysical_block_number[vtoken_depth] =
+      vphysical_block_number[vtoken_depth][vblock_depth] =
         block_table_seq[vblock_idx];
+     }
     }
 
-    _B16x16 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; //this could be B8x16 too
-    
-    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride;
+    _B16x16 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; //this can be interpreted as B8x16 too
+
+    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride + (((rowid/2) * VTOKENS_PER_LANE)%BLOCK_SIZE);
+    //const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride + ((rowid * VTOKENS_PER_LANE)%BLOCK_SIZE);
 
     //v fetches are 16head elems across lanes x 16 tokens per lane
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
@@ -2372,11 +2488,11 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
       const cache_t* v_ptr2 = v_ptr + vhead_elem * BLOCK_SIZE;
 
       for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
-          const int64_t vblock_number = static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
-          const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
-
           for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
-              const cache_t* v_fetch_ptr = v_ptr3 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+              //const int vblock_depth = 0;
+              const int64_t vblock_number = static_cast<int64_t>(vphysical_block_number[vtoken_depth][vfetch_depth / VBLOCKS_PER_LANE]);
+              const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
+              const cache_t* v_fetch_ptr = v_ptr3 + (vfetch_depth % VBLOCKS_PER_LANE) * CONTIGUOUS_KV_ELEMS_16B_LOAD;
               const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
               Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = from_B16x8(*v_fetch_ptr_16B);
           }
@@ -2384,12 +2500,25 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
 
     floatx8 dout[TLOOP];
-    __shared__ _B16x16 shared_logits[NWARPS][TLOOP][16][VTOKENS_PER_LANE/8 + 1];
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
       dout[token_depth] = {0};
       for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
+//        if (warpid == 0) {
+//              printf("[Klocal] token_depth: %d qkhe_depth: %d\n", token_depth, qkhe_depth);
+//              printBfloat16Vector(Klocal[token_depth][qkhe_depth]);
+//              printf("[Qlocal] token_depth: %d qkhe_depth: %d\n", token_depth, qkhe_depth);
+//              printBfloat16Vector(Qlocal[qkhe_depth]);
+//        }
+
         dout[token_depth] = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Klocal[token_depth][qkhe_depth], Qlocal[qkhe_depth], dout[token_depth]);
+
       }
+
+//      if (warpid == 0) {
+//        printf("[dout] token_depth: %d\n", token_depth);
+//        printFloat8Vector(dout[token_depth]);
+//      }
+ 
       dout[token_depth] *= scale;
     }
 #if 0 //DEBUG ONLY qk * scale
@@ -2400,6 +2529,31 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         *qkout_write_ptr = tmp;
     }
 #endif
+
+    __shared__ floatx8 shared_dout[NWARPS][TLOOP][16][2];
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        shared_dout[warpid][token_depth][lane16id][rowid] = dout[token_depth];
+    }
+    __syncthreads();
+
+    floatx8 dout_buf[TLOOP][2]; 
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        for (int i = 0; i < 2; i++) {
+            dout_buf[token_depth][i] = shared_dout[warpid][token_depth][lane16id][i];
+        }
+    }
+
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        for (int i = 0; i < 8; i++) {
+            shared_dout[warpid][token_depth][lane16id][rowid][i] = dout_buf[token_depth][i % 2][4 * rowid + (i / 2)];
+        }
+    }
+
+    __syncthreads();
+
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        dout[token_depth] = shared_dout[warpid][token_depth][lane16id][rowid];
+    }
 
     float qk_max = -FLT_MAX;
 
@@ -2413,9 +2567,17 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         }
     }
 
+//    if (warpid == 0) {
+//        printf("tid=%d [qk_max1]: %f ", threadIdx.x, qk_max);
+//    }
+
     for (int mask = WARP_SIZE/2; mask >= 16; mask/=2) {
         qk_max = fmaxf(qk_max, __shfl_xor(qk_max,mask));
     }
+
+//    if (warpid == 0) {
+//        printf("tid=%d [qk_max2]: %f ", threadIdx.x, qk_max);
+//    }
 
     float exp_sum = 0.0f;
 
@@ -2426,12 +2588,25 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
             dout[token_depth][i] = tmp;
             exp_sum += tmp;
         }
+
+//        if (warpid == 0) {
+//            printf("[dout] token_depth: %d\n", token_depth);
+//            printFloat8Vector(dout[token_depth]);
+//        }
     }
+ 
+//    if (warpid == 0) {
+//        printf("tid=%d [exp_sum1]: %f ", threadIdx.x, exp_sum);
+//    }
 
     for (int mask = WARP_SIZE/2; mask >= 16; mask/=2) {
         exp_sum += __shfl_xor(exp_sum,mask);
     }
-    
+
+//    if (warpid == 0) {
+//        printf("tid=%d [exp_sum2]: %f ", threadIdx.x, exp_sum);
+//    }
+
     if (laneid < 16) {
         shared_qk_max[warpid][lane16id] = qk_max;
         shared_exp_sum[warpid][lane16id] = exp_sum;
@@ -2459,17 +2634,55 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         partition_qk_max = fmaxf(partition_qk_max, warp_qk_max_exp[w]);
     }
 
+//    if (warpid == 0) {
+//        printf("tid=%d [partition_qk_max]: %f ", threadIdx.x, partition_qk_max);
+//    }
+
     for (int w=0; w<NWARPS; w++) {
         warp_qk_max_exp[w] = __expf(warp_qk_max_exp[w] - partition_qk_max);
         partition_exp_sum += shared_exp_sum[w][lane16id] * warp_qk_max_exp[w];
     }
 
+//    if (warpid == 0) {
+//        printf("tid=%d [partition_exp_sum]: %f ", threadIdx.x, partition_exp_sum);
+//    }
+
     const float inv_sum_scale = __fdividef(1.f, partition_exp_sum + 1e-6f) * warp_qk_max_exp[warpid];
+
+//    if (warpid == 0) {
+//        printf("tid=%d [inv_sum_scale]: %f ", threadIdx.x, inv_sum_scale);
+//    }
 
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         dout[token_depth] *= inv_sum_scale;
         shared_logits[warpid][token_depth][lane16id][rowid] = from_floatx8<scalar_t>(dout[token_depth]);
+//        if (warpid == 0) {
+//            printf("[shared_logits] token_depth: %d rowid: %d\n", token_depth, rowid);
+//            printBfloat16Vector(shared_logits[0][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[1][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[2][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[3][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[4][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[5][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[6][token_depth][lane16id][rowid]);
+//            printBfloat16Vector(shared_logits[7][token_depth][lane16id][rowid]);
+//        }
     }
+
+//    __syncthreads();
+//
+//    _B16x16 logits_buf[TLOOP][2]; 
+//    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+//        for (int i = 0; i < 2; i++) {
+//            logits_buf[token_depth][i] = shared_logits[warpid][token_depth][lane16id][i];
+//        }
+//    }
+//
+//    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+//        for (int i = 0; i < 16; i++) {
+//            shared_logits[warpid][token_depth][lane16id][rowid][i] = logits_buf[token_depth][i/8][i%8];
+//        }
+//    }
 
     if (threadIdx.x < GQA_RATIO) {
         const int qhead_idx = lane16id;
@@ -2493,6 +2706,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
 #endif
 
+    constexpr int ELEMS8_ELEMS8_RATIO = 8 / 8;
+
     _B16x16 outelems[VHELOOP];
     //v layout: 16he across lanes x 16 tokens per lane
 
@@ -2508,18 +2723,40 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
               //1 5 9  13
               //2 6 10 14
               //3 7 11 15
-              const int offset = 8*(rowid/2) + vfetch_depth; 
-              const int offset1 = offset % 8;
-              const int offset2 = offset / 8;
+              const int offset = vfetch_depth;
+              const int offset1 = offset % 2;
+              const int offset2 = offset / 2;
 
               //if output format is 16 head elems across 16 lanes, 16 qheads spread across 4 rows
               //tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(shared_logits[vtoken_depth][offset2][lane16id][offset1],
               //        Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i], tmp_out);
-
+ 
               //if output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
+ 
+              //if (warpid == 0 && laneid == 0) {
+              //    printf("[Vlocal & shared_logits]\n");
+              //    printBfloat16Vector(Vlocal[vtoken_depth][vhe_depth][vfetch_depth]);
+              //    printBfloat16Vector(shared_logits[vtoken_depth][offset2][lane16id][offset1]);
+              //}
+ 
+              //if (warpid == 0) {
+              //    printf("[Vlocal] vhe_depth:%d vtoken_depth:%d vfetch_depth:%d\n",vhe_depth, vtoken_depth, vfetch_depth);
+              //    printBfloat16Vector(Vlocal[vtoken_depth][vhe_depth][vfetch_depth]);
+              //}
+ 
+              //if (warpid == 0) {
+              //    printf("[shared_logits] vtoken_depth: %d vfetch_depth: %d offset2: %d offset1: %d\n", vtoken_depth, vfetch_depth, offset2, offset1);
+              //    printBfloat16Vector(shared_logits[vtoken_depth][offset2][lane16id][offset1]);
+              //}
+ 
               tmp_out = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Vlocal[vtoken_depth][vhe_depth][vfetch_depth],
                       shared_logits[vtoken_depth][offset2][lane16id][offset1],
                       tmp_out);
+              //if (warpid == 0) {
+              //    printf("[tmp_out] vtoken_depth: %d vfetch_depth: %d\n", vtoken_depth, vfetch_depth);
+              //    printFloat8Vector(tmp_out);
+              //}
+              
           }
         }
         outelems[vhe_depth] = from_floatx8<scalar_t>(tmp_out);
@@ -2532,34 +2769,96 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
 
     __syncthreads();
+    
 
+    _B16x16 swp_buf[VHELOOP][2]; // num_row: 2
+    for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+        for (int i = 0; i < 2; i++) {
+            swp_buf[vhe_depth][i] = shared_logits[warpid][vhe_depth][lane16id][i];
+        }
+    }
+
+    for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+        for (int i = 0; i < 8; i++) {
+            shared_logits[warpid][vhe_depth][lane16id][rowid][i] = swp_buf[vhe_depth][i % 2][4 * rowid + (i / 2)];
+        }
+    }
+
+    __syncthreads();
+
+    //if (warpid == 0 && laneid == 0) {
+    //    for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+    //        for (int i = 0; i < 8; i++) {
+    //            for (int j = 0; j < 16; j++) {
+    //                for (int k = 0; k < 2; k++) {
+    //                    printf("shared_logits[%d][%d][%d][%d]\n", i, vhe_depth, j, k);
+    //                    printBfloat16Vector(shared_logits[i][vhe_depth][j][k]);
+    //                }
+    //            }
+    //        }
+    //    }
+    //}
+
+    //write to tmp_out with coalesced writes after reading from shared mem
     if (warpid == 0) {
-        _B16x8 vout[GQA_RATIO4];
-        for (int h = 0; h < GQA_RATIO4; h++) {
-            const int local_head_idx = 4 * h + rowid;
-            const int head_elem_idx = lane16id * 8;
-            const int offset1 = (head_elem_idx / 16)%4;
+      _B16x8 vout[GQA_RATIO2];
+      //each lane writes out 16Bytes of tmp_out along head elem dimension
+      const int head_elem_idx = lane16id * 8;
+      if (head_elem_idx < HEAD_SIZE) {
+        for (int h = 0; h < GQA_RATIO2; h++) {
+            const int local_head_idx = 2 * h + rowid;
+            const int offset1 = (head_elem_idx / 16)%NWARPS;
             const int offset2 = head_elem_idx / 16 / NWARPS;
-            const int offset3 = (head_elem_idx / 4)%4;
+            const int offset3 = (head_elem_idx / 8)%2; // num_he % num_row
             vout[h] = from_B16x16(shared_logits[offset1][offset2][local_head_idx][offset3]);
         }
 
         const int hsz_maxp_mult = HEAD_SIZE * max_num_partitions; 
         scalar_t* out_ptr = out +
                           seq_idx * total_num_heads * hsz_maxp_mult + partition_idx * HEAD_SIZE;
-        for (int h = 0; h < GQA_RATIO4; h++) {
-            const int local_head_idx = 4 * h + rowid;
+        for (int h = 0; h < GQA_RATIO2; h++) {
+            const int local_head_idx = 2 * h + rowid;
             if (local_head_idx < GQA_RATIO) {
                 const int out_head_idx = wg_start_head_idx + local_head_idx;
                 scalar_t* out_ptr2 = out_ptr + out_head_idx * hsz_maxp_mult;
-                const int head_elem_idx = lane16id * 8;
                 scalar_t* out_ptr3 = out_ptr2 + head_elem_idx;
                 _B16x8* out_ptr_B16x8 = reinterpret_cast<_B16x8*>(out_ptr3);
                 *out_ptr_B16x8 = vout[h];
+                //printf("h=%d laneid=%d out_ptr3=%p\n", h, laneid, (void*)out_ptr);
+                //printBfloat8Vector(vout[h]);
             }
         }
-
+      }
     }
+
+//   if (warpid == 0) {
+//       _B16x8 vout[GQA_RATIO2];
+//       const int head_elem_idx = lane16id * 8;
+//       if (head_elem_idx < HEAD_SIZE) {
+//         for (int h = 0; h < GQA_RATIO2; h++) {
+//             const int local_head_idx = 2 * h + rowid;
+//             const int offset1 = (head_elem_idx / 16)%8;
+//             const int offset2 = head_elem_idx / 16 / NWARPS;
+//             const int offset3 = (head_elem_idx / 2)%2;
+//             vout[h] = from_B16x16(shared_logits[offset1][offset2][local_head_idx][offset3]);
+//         }
+//
+//         const int hsz_maxp_mult = HEAD_SIZE * max_num_partitions; 
+//         scalar_t* out_ptr = out +
+//                         seq_idx * total_num_heads * hsz_maxp_mult + partition_idx * HEAD_SIZE;
+//         for (int h = 0; h < GQA_RATIO2; h++) {
+//             const int local_head_idx = 2 * h + rowid;
+//             if (local_head_idx < GQA_RATIO) {
+//                 const int out_head_idx = wg_start_head_idx + local_head_idx;
+//                 scalar_t* out_ptr2 = out_ptr + out_head_idx * hsz_maxp_mult;
+//                 const int head_elem_idx = lane16id * 8;
+//                 scalar_t* out_ptr3 = out_ptr2 + head_elem_idx;
+//                 _B16x8* out_ptr_B16x8 = reinterpret_cast<_B16x8*>(out_ptr3);
+//                 *out_ptr_B16x8 = vout[h];
+//             }
+//         }
+//       }
+//   }
 
 
 #if 0

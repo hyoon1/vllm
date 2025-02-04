@@ -20,6 +20,7 @@ FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # - 512 as a buffer
 #MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
 MAX_SEQ_LEN = 32768
+#MAX_SEQ_LEN = 512
 # There may not be enough gpu memory due to large NUM_BLOCKS.
 # Reduce NUM_BLOCKS when it happens.
 NUM_BLOCKS = 128*1024+4321  # Arbitrary values for testing
@@ -31,9 +32,9 @@ DTYPES = [
 ] if not current_platform.is_rocm() else [torch.half,torch.bfloat16]
 NUM_GEN_SEQS = [17]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
-#NUM_HEADS = [(64, 8), (26,2), (16,1), (32,32)]  # Arbitrary values for testing
-#NUM_HEADS = [(32,32)]  # Arbitrary values for testing
-NUM_HEADS = [(16,1)]  # Arbitrary values for testing
+#NUM_PREFILL_SEQS = [1]  # Arbitrary values for testing
+NUM_HEADS = [(64, 8), (26,2), (16,1), (32,32)]  # Arbitrary values for testing
+#NUM_HEADS = [(16,1), (8,1)]  # Arbitrary values for testing
 
 # FlashAttention forward only supports head dimension at most 128
 # https://github.com/ROCmSoftwarePlatform/flash-attention/blob/3d2b6f5d037782cc2c906909a46fb7e2e1b48b25/csrc/flash_attn_rocm/flash_api.cpp#L62
