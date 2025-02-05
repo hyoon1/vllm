@@ -1643,13 +1643,19 @@ template <typename T>
 __device__ __forceinline__ _B16x16 from_floatx8(const floatx8& inp) {
   if constexpr (std::is_same<T, _Float16>::value) {
     union h2cvt {
-        __half2 h2[4];
+        __half2 h2[8];
         _B16x16 b16x16;
     } u;
+    const float2 zeros = make_float2(0.0f, 0.0f);
     u.h2[0] = __float22half2_rn(make_float2(inp[0],inp[1]));
     u.h2[1] = __float22half2_rn(make_float2(inp[2],inp[3]));
     u.h2[2] = __float22half2_rn(make_float2(inp[4],inp[5]));
     u.h2[3] = __float22half2_rn(make_float2(inp[6],inp[7]));
+    u.h2[4] = __float22half2_rn(zeros);
+    u.h2[5] = __float22half2_rn(zeros);
+    u.h2[6] = __float22half2_rn(zeros);
+    u.h2[7] = __float22half2_rn(zeros);
+
     return u.b16x16;
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
     _B16x16 ret;
@@ -1660,6 +1666,16 @@ __device__ __forceinline__ _B16x16 from_floatx8(const floatx8& inp) {
             float f32;
         } u;
         u.f32 = inp[i];
+        ret[i] = uint16_t(u.i32 >> 16);
+      }
+
+    #pragma unroll
+      for (int i = 8; i < 16; i++) {
+        union fcvt {
+            uint32_t i32;
+            float f32;
+        } u;
+        u.f32 = 0.0f;
         ret[i] = uint16_t(u.i32 >> 16);
       }
       return ret;
