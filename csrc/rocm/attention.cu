@@ -2013,13 +2013,19 @@ __device__ __forceinline__ _B16x16 from_floatx8(const floatx8& inp) {
 
   if constexpr (std::is_same<T, _Float16>::value) {
     union h2cvt {
-        __half2 h2[4];
+        __half2 h2[8];
         _B16x16 b16x16;
     } u;
+    const float2 zeros = make_float2(0.0f, 0.0f);
     u.h2[0] = __float22half2_rn(make_float2(inp[0],inp[1]));
     u.h2[1] = __float22half2_rn(make_float2(inp[2],inp[3]));
     u.h2[2] = __float22half2_rn(make_float2(inp[4],inp[5]));
     u.h2[3] = __float22half2_rn(make_float2(inp[6],inp[7]));
+    u.h2[4] = __float22half2_rn(zeros);
+    u.h2[5] = __float22half2_rn(zeros);
+    u.h2[6] = __float22half2_rn(zeros);
+    u.h2[7] = __float22half2_rn(zeros);
+
     return u.b16x16;
 
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
@@ -2031,6 +2037,16 @@ __device__ __forceinline__ _B16x16 from_floatx8(const floatx8& inp) {
             float f32;
         } u;
         u.f32 = inp[i];
+        ret[i] = uint16_t(u.i32 >> 16);
+      }
+
+    #pragma unroll
+      for (int i = 8; i < 16; i++) {
+        union fcvt {
+            uint32_t i32;
+            float f32;
+        } u;
+        u.f32 = 0.0f;
         ret[i] = uint16_t(u.i32 >> 16);
       }
       return ret;
@@ -2373,12 +2389,12 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         }
     }
 
-    //if (warpid == 0 && laneid == 0) {
-    //    for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
-    //        printf("[Qlocal] qkhe_depth: %d\n", qkhe_depth);
-    //        printBfloat16Vector(Qlocal[qkhe_depth]);
-    //    }
-    //}
+//    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warpid == 0) {
+//        for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
+//            printf("[Qlocal] qkhe_depth: %d\n", qkhe_depth);
+//            printBfloat16Vector(Qlocal[qkhe_depth]);
+//        }
+//    }
 
     constexpr int KX = 16 / sizeof(cache_t); //8
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
@@ -2403,7 +2419,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
       }
     }
 
-//    if (warpid == 0 && lane16id == 1) {
+//    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warpid == 0) {
 //        for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
 //            printf("[Klocal] qkhe_depth: %d\n", qkhe_depth);
 //            printBfloat16Vector(Klocal[0][qkhe_depth]);
@@ -2514,7 +2530,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
 
       }
 
-//      if (warpid == 0) {
+//      if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warpid == 0) {
 //        printf("[dout] token_depth: %d\n", token_depth);
 //        printFloat8Vector(dout[token_depth]);
 //      }
@@ -2603,6 +2619,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         exp_sum += __shfl_xor(exp_sum,mask);
     }
 
+    __syncthreads();
+
 //    if (warpid == 0) {
 //        printf("tid=%d [exp_sum2]: %f ", threadIdx.x, exp_sum);
 //    }
@@ -2653,10 +2671,12 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
 //        printf("tid=%d [inv_sum_scale]: %f ", threadIdx.x, inv_sum_scale);
 //    }
 
+    __syncthreads();
+
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         dout[token_depth] *= inv_sum_scale;
         shared_logits[warpid][token_depth][lane16id][rowid] = from_floatx8<scalar_t>(dout[token_depth]);
-//        if (warpid == 0) {
+//        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warpid == 0) {
 //            printf("[shared_logits] token_depth: %d rowid: %d\n", token_depth, rowid);
 //            printBfloat16Vector(shared_logits[0][token_depth][lane16id][rowid]);
 //            printBfloat16Vector(shared_logits[1][token_depth][lane16id][rowid]);
@@ -2727,6 +2747,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
               const int offset1 = offset % 2;
               const int offset2 = offset / 2;
 
+              //_B16x16 Vlocaltmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+              //_B16x16 douttmp = shared_logits[vtoken_depth][offset2][lane16id][offset1];
               //if output format is 16 head elems across 16 lanes, 16 qheads spread across 4 rows
               //tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(shared_logits[vtoken_depth][offset2][lane16id][offset1],
               //        Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i], tmp_out);
@@ -2752,7 +2774,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
               tmp_out = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Vlocal[vtoken_depth][vhe_depth][vfetch_depth],
                       shared_logits[vtoken_depth][offset2][lane16id][offset1],
                       tmp_out);
-              //if (warpid == 0) {
+
+              //tmp_out = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Vlocaltmp, douttmp, tmp_out);
+
+              //if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warpid == 0) {
               //    printf("[tmp_out] vtoken_depth: %d vfetch_depth: %d\n", vtoken_depth, vfetch_depth);
               //    printFloat8Vector(tmp_out);
               //}
