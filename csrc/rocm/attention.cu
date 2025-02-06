@@ -1528,7 +1528,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   }
 }
 
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#elif defined(__HIP__NAVI3__)
 
 using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using floatx8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
@@ -1542,11 +1542,20 @@ typedef struct _Half8 {
 using bit16_t = uint16_t;
 using bit16x4 = __attribute__((__vector_size__(4 * sizeof(uint16_t)))) uint16_t;
 typedef bit16x4 _B16x4;
-typedef struct _B16x8 {
+
+using bit16x8 = __attribute__((__vector_size__(8 * sizeof(uint16_t)))) uint16_t;
+union b16x8_u {
+  bit16x8 u16x8;
   _B16x4 xy[2];
-} _B16x8;
+};
+typedef b16x8_u _B16x8;
+
 using bit16x16 = __attribute__((__vector_size__(16 * sizeof(uint16_t)))) uint16_t;
-typedef bit16x16 _B16x16;
+union b16x16_u {
+  bit16x16 u16x16;
+  _B16x8 xy[2];
+};
+typedef b16x16_u _B16x16;
 
 using _B8x8 = uint2;
 using bit8_t = uint8_t;
@@ -1556,8 +1565,8 @@ typedef struct _B8x16 {
 } _B8x16;
 
 template <typename T, int absz, int cbid, int blgp>
-__device__ __forceinline__ floatx8 gcn_wmma16x16x16_instr(const _B16x16& inpA,
-                                                  const _B16x16& inpB,
+__device__ __forceinline__ floatx8 gcn_wmma16x16x16_instr(const bit16x16& inpA,
+                                                  const bit16x16& inpB,
                                                   const floatx8& inpC) {
   if constexpr (std::is_same<T, _Float16>::value) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(inpA, inpB, inpC);
@@ -1646,147 +1655,29 @@ __device__ __forceinline__ _B16x16 from_floatx8(const floatx8& inp) {
         __half2 h2[8];
         _B16x16 b16x16;
     } u;
-    const float2 zeros = make_float2(0.0f, 0.0f);
     u.h2[0] = __float22half2_rn(make_float2(inp[0],inp[1]));
     u.h2[1] = __float22half2_rn(make_float2(inp[2],inp[3]));
     u.h2[2] = __float22half2_rn(make_float2(inp[4],inp[5]));
     u.h2[3] = __float22half2_rn(make_float2(inp[6],inp[7]));
-    u.h2[4] = __float22half2_rn(zeros);
-    u.h2[5] = __float22half2_rn(zeros);
-    u.h2[6] = __float22half2_rn(zeros);
-    u.h2[7] = __float22half2_rn(zeros);
-
+    u.b16x16.xy[1] = {0};
     return u.b16x16;
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
     _B16x16 ret;
     #pragma unroll
       for (int i = 0; i < 8; i++) {
         union fcvt {
-            uint32_t i32;
-            float f32;
+          uint32_t u32;
+          float f32;
         } u;
         u.f32 = inp[i];
-        ret[i] = uint16_t(u.i32 >> 16);
+        u.u32 += 0x7fff + ((u.u32 >> 16) & 1);  // BF16 RNE with no nan/inf check
+        ret.u16x16[i] = uint16_t(u.u32 >> 16);
       }
-
-    #pragma unroll
-      for (int i = 8; i < 16; i++) {
-        union fcvt {
-            uint32_t i32;
-            float f32;
-        } u;
-        u.f32 = 0.0f;
-        ret[i] = uint16_t(u.i32 >> 16);
-      }
-      return ret;
-  } else {
-    static_assert(false, "unsupported 16b dtype");
-  }
-}
-
-__device__ __forceinline__ _B16x16 from_B16x8(const _B16x8& inp) {
-    _B16x16 ret = {0};
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        ret[i] = inp.xy[i / 4][i % 4];
-    }
-    return ret;
-}
-__device__ __forceinline__ _B16x8 from_B16x16(const _B16x16& inp) {
-    _B16x8 ret;
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        ret.xy[i / 4][i % 4] = inp[i];
-    }
-    return ret;
-}
-
-template <typename T>
-__device__ __forceinline__ _B16x4 addx4(const _B16x4& inp1,
-                                        const _B16x4& inp2) {
-  union tmpcvt {
-    uint16_t u;
-    _Float16 f;
-    __hip_bfloat16 b;
-  } t1, t2, res;
-  _B16x4 ret;
-  if constexpr (std::is_same<T, _Float16>::value) {
-    union h2cvt {
-      _B16x4 b16x4;
-      __half2 h2[2];
-    } u1, u2, s;
-    u1.b16x4 = inp1;
-    u2.b16x4 = inp2;
-    s.h2[0] = u1.h2[0] + u2.h2[0];
-    s.h2[1] = u1.h2[1] + u2.h2[1];
-    return s.b16x4;
-  } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-    for (int i = 0; i < 4; i++) {
-      union fcvt {
-        float f32;
-        uint32_t i32;
-      } u1, u2, s;
-      u1.i32 = uint32_t(inp1[i]) << 16;
-      u2.i32 = uint32_t(inp2[i]) << 16;
-      s.f32 = u1.f32 + u2.f32;
-      ret[i] = uint16_t(s.i32 >> 16);
-    }
+    ret.xy[1] = {0};
     return ret;
   } else {
     static_assert(false, "unsupported 16b dtype");
   }
-}
-
-template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
-__device__ __forceinline__ _B16x8 scaled_convert_b8x8(const _B8x8 input,
-                                                      const float scale) {
-  union alignas(16) {
-    uint4 u4;
-    _B16x8 u16x8;
-    vllm::bf16_8_t b16x8;
-  } tmp;
-  if constexpr (std::is_same<T, _Float16>::value) {
-    tmp.u4 = vllm::fp8::scaled_convert<uint4, _B8x8, KV_DTYPE>(input, scale);
-    return tmp.u16x8;
-  } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-    tmp.b16x8 = vllm::fp8::scaled_convert<vllm::bf16_8_t, _B8x8, KV_DTYPE>(
-        input, scale);
-    return tmp.u16x8;
-  } else {
-    static_assert(false, "unsupported 16b dtype");
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ _B16x8
-scaled_convert_b8x8_custom(const _B8x8 input, const float scale) {
-  union {
-    floatx4 f32x4[2];
-    vllm::Float8_ f32x8;
-  } tmpf8;
-  tmpf8.f32x8 = vllm::fp8::vec_conversion<vllm::Float8_, uint2>(
-      *reinterpret_cast<const uint2*>(&input));
-
-  tmpf8.f32x4[0] *= scale;
-  tmpf8.f32x4[1] *= scale;
-
-  _B16x8 ret;
-  ret.xy[0] = from_floatx4<T>(tmpf8.f32x4[0]);
-  ret.xy[1] = from_floatx4<T>(tmpf8.f32x4[1]);
-  return ret;
-}
-
-template <typename T>
-__device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input) {
-  union {
-    floatx4 f32x4[2];
-    vllm::Float8_ f32x8;
-  } tmpf8;
-  tmpf8.f32x8 = vllm::fp8::vec_conversion<vllm::Float8_,uint2>(*reinterpret_cast<const uint2*>(&input));
-  _B16x8 ret;
-  ret.xy[0] = from_floatx4<T>(tmpf8.f32x4[0]);
-  ret.xy[1] = from_floatx4<T>(tmpf8.f32x4[1]);
-  return ret;
 }
 
 template <typename scalar_t, typename cache_t,
@@ -1845,10 +1736,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
   constexpr int ROWS_PER_WARP = 1; //rows refers to 16 lanes; refer dpp terminology
   constexpr int CONTIGUOUS_KV_ELEMS_16B_LOAD = 16 / sizeof(cache_t); //8 for 16 bit cache type, 16 for 8 bit types
   constexpr int QKHE_PER_FETCH = CONTIGUOUS_KV_ELEMS_16B_LOAD * ROWS_PER_WARP; //each fetch across a warp fetches these many elements
-  constexpr int QK_SIZE_RATIO = sizeof(scalar_t) / sizeof(cache_t); //1 for 16bit types, 2 for 8bit types
   constexpr int QKHELOOP = HEAD_SIZE / QKHE_PER_FETCH; //1xQKHE_16B across warp
-  //_B16x8 Qlocal[QKHELOOP][QK_SIZE_RATIO]; //note that 16 contiguous elements of Q should be fetched per lane for 8 bit cache types : QK_SIZE_RATIO changes for this
-  //_B16x16 Qlocal[QKHELOOP][QK_SIZE_RATIO]; //note that 16 contiguous elements of Q should be fetched per lane for 16 bit cache types : QK_SIZE_RATIO changes for this
   _B16x16 Qlocal[QKHELOOP]; //note that 16 contiguous elements of Q should be fetched per lane for 16 bit cache types : QK_SIZE_RATIO changes for this
   constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 16 / sizeof(scalar_t);
   constexpr int x = CONTIGUOUS_SCALAR_ELEMS_16B; //x is defined by vLLM as 16Bytes
@@ -1871,16 +1759,18 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int local_qhead_idx = lane16id % GQA_RATIO;
     const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
     const int64_t seq_idx64 = static_cast<int64_t>(seq_idx);
-    const scalar_t* q_ptr = q + seq_idx64 * q_stride + global_qhead_idx * HEAD_SIZE + (rowid / 2) * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+    const scalar_t* q_ptr = q + seq_idx64 * q_stride + global_qhead_idx * HEAD_SIZE;
     if (lane16id < GQA_RATIO) {
         for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
             const scalar_t* q_fetch_ptr = q_ptr + qkhe_depth * QKHE_PER_FETCH;
             const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
-            Qlocal[qkhe_depth] = from_B16x8(*q_fetch_ptr_16B);
+            Qlocal[qkhe_depth].xy[0] = *q_fetch_ptr_16B;
+            Qlocal[qkhe_depth].xy[1].u16x8 = {0};
         }
     } else {
+      #pragma unroll
         for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
-            Qlocal[qkhe_depth] = {0};
+            Qlocal[qkhe_depth].u16x16 = {0};
         }
     }
 
@@ -1903,7 +1793,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
     constexpr int KX = 16 / sizeof(cache_t);
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
-    const int row_head_elem = (rowid/2) * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+    const int row_head_elem = 0;
 
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
       const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[token_depth]);
@@ -1919,7 +1809,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         const int offset2 = head_elem % KX;
         const cache_t* k_fetch_ptr = k_ptr3 + offset1 * BLOCK_SIZE * KX + offset2;
         const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
-        Klocal[token_depth][qkhe_depth] = from_B16x8(*k_fetch_ptr_16B);
+        Klocal[token_depth][qkhe_depth].xy[0] = *k_fetch_ptr_16B;
+        Klocal[token_depth][qkhe_depth].xy[1].u16x8 = {0};
       }
     }
     //////////// end fetch k
@@ -1936,7 +1827,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     //fetch v physical block numbers
     for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
       for (int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++) {
-        const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + (rowid/2) * VTOKENS_PER_LANE + vblock_depth * BLOCK_SIZE;
+        const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + vblock_depth * BLOCK_SIZE;
         const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
         const int vblock_idx = (vglobal_token_idx < context_len)
                                 ? vglobal_token_idx / BLOCK_SIZE
@@ -1945,58 +1836,63 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
           block_table_seq[vblock_idx];
       }
     }
+
     _B16x16 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; //this can be interpreted as B8x16 too
 
-    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride + (((rowid/2) * VTOKENS_PER_LANE)%BLOCK_SIZE);
+    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride;
     //v fetches are 16head elems across lanes x 16 tokens per lane
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
       const int vhead_elem = vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
       const cache_t* v_ptr2 = v_ptr + vhead_elem * BLOCK_SIZE;
-
       for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
           for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
               const int64_t vblock_number = static_cast<int64_t>(vphysical_block_number[vtoken_depth][vfetch_depth / VBLOCKS_PER_LANE]);
               const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
               const cache_t* v_fetch_ptr = v_ptr3 + (vfetch_depth % VBLOCKS_PER_LANE) * CONTIGUOUS_KV_ELEMS_16B_LOAD;
               const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
-              Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = from_B16x8(*v_fetch_ptr_16B);
+              Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[0] = *v_fetch_ptr_16B;
+              Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[1].u16x8 = {0};
           }
       }
-    }
-
-    // calculate post qk mfma scale
-    float scale2 = scale;
-    if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
-      // multiply by k_scale if fp8 kv cache
-      scale2 *= *k_scale_ptr;
     }
 
     floatx8 dout[TLOOP]; // QK
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
       dout[token_depth] = {0};
       for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
-        dout[token_depth] = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Klocal[token_depth][qkhe_depth], Qlocal[qkhe_depth], dout[token_depth]);
+        dout[token_depth] = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Klocal[token_depth][qkhe_depth].u16x16, Qlocal[qkhe_depth].u16x16, dout[token_depth]);
       }
-      dout[token_depth] *= scale2;
+      dout[token_depth] *= scale;
     }
 
     __shared__ floatx8 shared_dout[NWARPS][TLOOP][16][2];
+  #pragma unroll
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         shared_dout[warpid][token_depth][lane16id][rowid] = dout[token_depth];
     }
+
     __syncthreads();
+
     floatx8 dout_buf[TLOOP][2];
+  #pragma unroll
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+      #pragma unroll
         for (int i = 0; i < 2; i++) {
             dout_buf[token_depth][i] = shared_dout[warpid][token_depth][lane16id][i];
         }
     }
+
+  #pragma unroll
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+      #pragma unroll
         for (int i = 0; i < 8; i++) {
             shared_dout[warpid][token_depth][lane16id][rowid][i] = dout_buf[token_depth][i % 2][4 * rowid + (i / 2)];
         }
     }
+
     __syncthreads();
+
+  #pragma unroll
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         dout[token_depth] = shared_dout[warpid][token_depth][lane16id][rowid];
     }
@@ -2011,9 +1907,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             qk_max = fmaxf(qk_max, tmp);
         }
     }
+
+  #pragma unroll
     for (int mask = WARP_SIZE/2; mask >= 16; mask/=2) {
         qk_max = fmaxf(qk_max, __shfl_xor(qk_max,mask));
     }
+
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         const int local_token_idx = qkout_token_idx + token_depth * 16;
         for (int i=0; i<8; i++) {
@@ -2022,6 +1921,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             exp_sum += tmp;
         }
     }
+
+  #pragma unroll
     for (int mask = WARP_SIZE/2; mask >= 16; mask/=2) {
         exp_sum += __shfl_xor(exp_sum,mask);
     }
@@ -2032,6 +1933,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         shared_qk_max[warpid][lane16id] = qk_max;
         shared_exp_sum[warpid][lane16id] = exp_sum;
     }
+
     __syncthreads();
 
     // calculate partition qk_max and exp_sum
@@ -2039,6 +1941,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float warp_qk_max_exp[NWARPS];
     float partition_exp_sum = 0.0f;
 
+  #pragma unroll
     for (int w=0; w<NWARPS; w++) {
         warp_qk_max_exp[w] = shared_qk_max[w][lane16id];
         partition_qk_max = fmaxf(partition_qk_max, warp_qk_max_exp[w]);
@@ -2072,27 +1975,23 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // v layout: 16he across lanes x 16 tokens per lane
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
         floatx8 tmp_out = {0};
-
         for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
           for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
                 const int offset = vfetch_depth;
                 const int offset1 = offset % 2;
                 const int offset2 = offset / 2;
-                //if output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
-                tmp_out = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Vlocal[vtoken_depth][vhe_depth][vfetch_depth],
-                      shared_logits[vtoken_depth][offset2][lane16id][offset1],
+                //if output format is 16 qheads across 16 lanes, 16 head elems spread across rows
+                tmp_out = gcn_wmma16x16x16_instr<scalar_t, 0, 0, 0>(Vlocal[vtoken_depth][vhe_depth][vfetch_depth].u16x16,
+                      shared_logits[vtoken_depth][offset2][lane16id][offset1].u16x16,
                       tmp_out);
           }
-        }
-        // apply post Softmax V mfma v_scale
-        if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
-          tmp_out *= *v_scale_ptr;
         }
         outelems[vhe_depth] = from_floatx8<scalar_t>(tmp_out);
     }
 
     __syncthreads();
 
+  #pragma unroll
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
         shared_logits[warpid][vhe_depth][lane16id][rowid] =outelems[vhe_depth]; //lane16 id head dimension; rowid head element dimension
     }
@@ -2100,14 +1999,19 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     __syncthreads();
 
     _B16x16 swp_buf[VHELOOP][2]; // num_row: 2
+  #pragma unroll
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+      #pragma unroll
         for (int i = 0; i < 2; i++) {
             swp_buf[vhe_depth][i] = shared_logits[warpid][vhe_depth][lane16id][i];
         }
     }
+
+  #pragma unroll
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+      #pragma unroll
         for (int i = 0; i < 8; i++) {
-            shared_logits[warpid][vhe_depth][lane16id][rowid][i] = swp_buf[vhe_depth][i % 2][4 * rowid + (i / 2)];
+            shared_logits[warpid][vhe_depth][lane16id][rowid].u16x16[i] = swp_buf[vhe_depth][i % 2].u16x16[4 * rowid + (i / 2)];
         }
     }
 
@@ -2123,7 +2027,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             const int offset1 = (head_elem_idx / 16) % NWARPS;
             const int offset2 = head_elem_idx / 16 / NWARPS;
             const int offset3 = (head_elem_idx / 8) % 2; // num_he % num_row
-            vout[h] = from_B16x16(shared_logits[offset1][offset2][local_head_idx][offset3]);
+            vout[h] = shared_logits[offset1][offset2][local_head_idx][offset3].xy[0];
         }
 
         const int hsz_maxp_mult = HEAD_SIZE * max_num_partitions;
@@ -2141,34 +2045,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         }
       }
     }
-}
-
-template <typename scalar_t, typename cache_t,
-          vllm::Fp8KVCacheDataType KV_DTYPE, typename OUTT, int BLOCK_SIZE,
-          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
-          int GQA_RATIO>
-__global__
-__launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
-    const scalar_t* __restrict__ q,       // [num_seqs, num_heads, head_size]
-    const cache_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads,
-                                          // head_size/x, block_size, x]
-    const cache_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
-                                          // head_size, block_size]
-    const int num_kv_heads, const float scale,
-    const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
-    const int* __restrict__ context_lens,  // [num_seqs]
-    const int max_num_blocks_per_seq,
-    const float* __restrict__ alibi_slopes,  // [num_heads]
-    const int q_stride, const int kv_block_stride, const int kv_head_stride,
-    float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits,  // [num_seqs, num_heads,
-                                     // max_num_partitions]
-    scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
-                                   // head_size]
-    OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale,
-    const float* __restrict__ fp8_out_scale_ptr) {
-  UNREACHABLE_CODE
 }
 
 // Grid: (num_heads, num_seqs).
@@ -2364,6 +2240,81 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   } else {
     out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
   }
+}
+
+#else
+
+template <typename scalar_t, typename cache_t,
+          vllm::Fp8KVCacheDataType KV_DTYPE, typename OUTT, int BLOCK_SIZE,
+          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
+          int GQA_RATIO>
+__global__
+__launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
+    const scalar_t* __restrict__ q,       // [num_seqs, num_heads, head_size]
+    const cache_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads,
+                                          // head_size/x, block_size, x]
+    const cache_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
+                                          // head_size, block_size]
+    const int num_kv_heads, const float scale,
+    const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
+    const int* __restrict__ context_lens,  // [num_seqs]
+    const int max_num_blocks_per_seq,
+    const float* __restrict__ alibi_slopes,  // [num_heads]
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
+    float* __restrict__ max_logits,  // [num_seqs, num_heads,
+                                     // max_num_partitions]
+    scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
+                                   // head_size]
+    OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
+    int max_ctx_blocks, const float* k_scale_ptr, const float* v_scale_ptr,
+    const float* __restrict__ fp8_out_scale_ptr) {
+  UNREACHABLE_CODE
+}
+
+template <typename scalar_t, typename cache_t,
+          vllm::Fp8KVCacheDataType KV_DTYPE, typename OUTT, int BLOCK_SIZE,
+          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
+          int GQA_RATIO>
+__global__
+__launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
+    const scalar_t* __restrict__ q,       // [num_seqs, num_heads, head_size]
+    const cache_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads,
+                                          // head_size/x, block_size, x]
+    const cache_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
+                                          // head_size, block_size]
+    const int num_kv_heads, const float scale,
+    const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
+    const int* __restrict__ context_lens,  // [num_seqs]
+    const int max_num_blocks_per_seq,
+    const float* __restrict__ alibi_slopes,  // [num_heads]
+    const int q_stride, const int kv_block_stride, const int kv_head_stride,
+    float* __restrict__ exp_sums,  // [num_seqs, num_heads, max_num_partitions]
+    float* __restrict__ max_logits,  // [num_seqs, num_heads,
+                                     // max_num_partitions]
+    scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
+                                   // head_size]
+    OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ fp8_out_scale_ptr) {
+  UNREACHABLE_CODE
+}
+
+// Grid: (num_heads, num_seqs).
+template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
+          int PARTITION_SIZE, int NPAR_LOOPS>
+__global__
+__launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
+    OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
+    const float* __restrict__ exp_sums,    // [num_seqs, num_heads,
+                                           // max_num_partitions]
+    const float* __restrict__ max_logits,  // [num_seqs, num_heads,
+                                           // max_num_partitions]
+    const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_heads,
+                                           // max_num_partitions, head_size]
+    const int* __restrict__ context_lens,  // [num_seqs]
+    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
+  UNREACHABLE_CODE
 }
 
 #endif
