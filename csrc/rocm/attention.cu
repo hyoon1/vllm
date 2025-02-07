@@ -2424,6 +2424,7 @@ void paged_attention_custom_launcher(
       LAUNCH_CUSTOM_ATTENTION_MFMA4(4);
       break;
 #else
+    case 1:
       LAUNCH_CUSTOM_ATTENTION_MFMA16(1);
       break;
     case 2:
