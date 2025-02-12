@@ -908,7 +908,8 @@ def _use_rocm_custom_paged_attention(qtype: torch.dtype, head_size: int,
                                      kv_cache_dtype: str,
                                      alibi_slopes: Optional[torch.Tensor] = None) -> bool:
     if _ON_NAVI3:
-        return ((qtype == torch.half or qtype == torch.bfloat16)
+        return (envs.VLLM_USE_ROCM_CUSTOM_PAGED_ATTN
+                and (qtype == torch.half or qtype == torch.bfloat16)
                 and head_size == 128
                 and block_size == 16
                 and (gqa_ratio >= 1 and gqa_ratio <= 16)
