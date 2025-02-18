@@ -1661,18 +1661,17 @@ __device__ __forceinline__ _B16x8 from_floatx8(const floatx8& inp) {
     u.h2[3] = __float22half2_rn(make_float2(inp[6],inp[7]));
     return u.b16x8;
   } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-    _B16x8 ret;
-    #pragma unroll
-      for (int i = 0; i < 8; i++) {
-        union fcvt {
-          uint32_t u32;
-          float f32;
-        } u;
-        u.f32 = inp[i];
-        u.u32 += 0x7fff + ((u.u32 >> 16) & 1);  // BF16 RNE with no nan/inf check
-        ret.u16x8[i] = uint16_t(u.u32 >> 16);
-      }
-    return ret;
+    union b2cvt {
+        __hip_bfloat162 b2[4];
+        _B16x8 b16x8;
+    } u;
+
+    u.b2[0] = __float22bfloat162_rn(make_float2(inp[0],inp[1]));
+    u.b2[1] = __float22bfloat162_rn(make_float2(inp[2],inp[3]));
+    u.b2[2] = __float22bfloat162_rn(make_float2(inp[4],inp[5]));
+    u.b2[3] = __float22bfloat162_rn(make_float2(inp[6],inp[7]));
+
+    return u.b16x8;
   } else {
     static_assert(false, "unsupported 16b dtype");
   }
@@ -1896,7 +1895,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // calculate qk_max and exp_sum per warp and write to shared memory
     float qk_max = -FLT_MAX;
     float exp_sum = 0.0f;
-    //const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 8;
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid;
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         const int local_token_idx = qkout_token_idx + token_depth * 16;
