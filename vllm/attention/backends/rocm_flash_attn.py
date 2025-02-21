@@ -16,6 +16,7 @@ from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils import is_navi
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -837,6 +838,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     layer._v_scale,
                     fp8_out_scale if cpa_fp8_out else None,
                     _PARTITION_SIZE_ROCM,
+                    is_navi(),
                 )
                 if cpa_fp8_out:
                     return out.view(num_seqs, num_heads * head_size)
@@ -915,7 +917,7 @@ def _use_rocm_custom_paged_attention(qtype: torch.dtype, head_size: int,
                 and (gqa_ratio >= 1 and gqa_ratio <= 16)
                 and max_seq_len <= 128 * 1024
                 and alibi_slopes is None
-                and "fp8" not in kv_cache_dtype.lower())
+                and kv_cache_dtype == "auto")
     else:
         return (_ON_MI250_MI300
                 and (qtype == torch.half or qtype == torch.bfloat16)
