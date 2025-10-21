@@ -173,6 +173,9 @@ class RocmPlatform(Platform):
         "awq", "gptq", "fp8", "compressed-tensors", "fbgemm_fp8", "gguf",
         "quark", "ptpc_fp8", "mxfp4", "petit_nvfp4"
     ]
+    # bitsandbytes is not supported on GPUs with warp size 64 (gfx9)
+    if not on_gfx9():
+        supported_quantization += ["bitsandbytes"]
 
     @classmethod
     def get_vit_attn_backend(cls, support_fa: bool = False) -> _Backend:
