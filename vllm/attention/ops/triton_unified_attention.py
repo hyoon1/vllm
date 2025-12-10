@@ -218,120 +218,217 @@ def kernel_unified_attention_2d(
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
     # iterate through tiles (now limited to the sliding window range)
-    for j in range(tile_start, tile_end):
-        seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
+    if TILE_SIZE == BLOCK_SIZE:
+        offs_n = tl.arange(0, BLOCK_SIZE)
+        for j in range(tile_start, tile_end):
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j).to(
+                tl.int64
+            )
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+            v_offset = (
+                physical_block_idx * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + offs_n[:, None] * stride_v_cache_1
+            )
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+            k_offset = (
+                physical_block_idx * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + offs_n[None, :] * stride_k_cache_1
+            )
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            # K : (HEAD_SIZE, BLOCK_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset, mask=dim_mask[:, None], other=0.0
+            )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
                 K = K_load
+
+            # V : (BLOCK_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset, mask=dim_mask[None, :], other=0.0
+            )
+
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
-
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
                 V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+            seq_offset = j * BLOCK_SIZE + offs_n
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+            # S : (BLOCK_M, BLOCK_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
 
-        S += scale * tl.dot(Q, K)
+            S += scale * tl.dot(Q, K)
 
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
-        if SLIDING_WINDOW > 0:
             S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
                 S,
                 float("-inf"),
             )
 
-        if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len)
+            if SLIDING_WINDOW > 0:
+                S = tl.where(
+                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                    S,
+                    float("-inf"),
+                )
 
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len)
+
+            if USE_QQ_BIAS:
+                key_rel_pos = seq_offset - context_len
+                is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],
+                    other=0.0,
+                )
+                S += qq_bias
+
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            P = tl.exp(S - m_j[:, None])
+            l_j = tl.sum(P, axis=1)
+            alpha = tl.exp(M - m_j)
+            acc = acc * alpha[:, None]
+            L = L * alpha + l_j
+            M = m_j
+            acc += tl.dot(P.to(V.dtype), V)
+    else:
+        for j in range(tile_start, tile_end):
+            seq_offset = j * TILE_SIZE + offs_t
+            tile_mask = seq_offset < max_seq_prefix_len
+
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+
+            # K : (HEAD_SIZE, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
                 other=0.0,
             )
-            S += qq_bias
 
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
+                K = K_load
 
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
 
-        # P : (BLOCK_M, TILE_SIZE)
-        P = tl.exp(S - m_j[:, None])
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+            else:
+                V = V_load
 
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+            # S : (BLOCK_M, TILE_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
+            S += scale * tl.dot(Q, K)
 
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                S,
+                float("-inf"),
+            )
+
+            if SLIDING_WINDOW > 0:
+                S = tl.where(
+                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                    S,
+                    float("-inf"),
+                )
+
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len)
+
+            if USE_QQ_BIAS:
+                # compute key positions relative to query section
+                key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
+                # load bias only for keys that correspond to queries
+                is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],  # avoid OOB for context keys
+                    other=0.0,
+                )
+                S += qq_bias
+
+            # compute running maximum
+            # m_j : (BLOCK_M,)
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+
+            # For sliding window there's a chance the max is -inf due to masking of
+            # the entire row. In this case we need to set m_j 0 to avoid NaN
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            # P : (BLOCK_M, TILE_SIZE)
+            P = tl.exp(S - m_j[:, None])
+
+            # l_j : (BLOCK_M,)
+            l_j = tl.sum(P, axis=1)
+
+            # alpha : (BLOCK_M, )
+            alpha = tl.exp(M - m_j)
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc = acc * alpha[:, None]
+
+            # update constants
+            L = L * alpha + l_j
+            M = m_j
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     acc = acc / L[:, None]
@@ -503,123 +600,216 @@ def kernel_unified_attention_3d(
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
+    tile_begin = segm_idx * tiles_per_segment
+    tile_end = tl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
+
     # iterate through tiles within current segment
-    for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
-    ):
-        seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
+    if TILE_SIZE == BLOCK_SIZE:
+        offs_n = tl.arange(0, BLOCK_SIZE)
+        for j in range(tile_begin, tile_end):
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j).to(
+                tl.int64
+            )
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+            v_offset = (
+                physical_block_idx * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + offs_n[:, None] * stride_v_cache_1
+            )
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+            k_offset = (
+                physical_block_idx * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + offs_n[None, :] * stride_k_cache_1
+            )
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            # K : (HEAD_SIZE, BLOCK_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset, mask=dim_mask[:, None], other=0.0
+            )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
                 K = K_load
+
+            # V : (BLOCK_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset, mask=dim_mask[None, :], other=0.0
+            )
+
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
-
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
                 V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+            seq_offset = j * BLOCK_SIZE + offs_n
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+            # S : (BLOCK_M, BLOCK_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+            S += scale * tl.dot(Q, K)
 
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
-        if SLIDING_WINDOW > 0:
             S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
                 S,
                 float("-inf"),
             )
 
-        if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len)
+            if SLIDING_WINDOW > 0:
+                S = tl.where(
+                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                    S,
+                    float("-inf"),
+                )
 
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len)
+
+            if USE_QQ_BIAS:
+                key_rel_pos = seq_offset - context_len
+                is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],
+                    other=0.0,
+                )
+                S += qq_bias
+
+            # compute running maximum
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            P = tl.exp(S - m_j[:, None])
+            l_j = tl.sum(P, axis=1)
+            alpha = tl.exp(M - m_j)
+            acc = acc * alpha[:, None]
+            L = L * alpha + l_j
+            M = m_j
+            acc += tl.dot(P.to(V.dtype), V)
+    else:
+        for j in range(tile_begin, tile_end):
+            seq_offset = j * TILE_SIZE + offs_t
+            tile_mask = seq_offset < max_seq_prefix_len
+
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+
+            # K : (HEAD_SIZE, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
                 other=0.0,
             )
-            S += qq_bias
 
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
+                K = K_load
 
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
 
-        # P : (BLOCK_M, TILE_SIZE,)
-        P = tl.exp(S - m_j[:, None])
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+            else:
+                V = V_load
 
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+            # S : (BLOCK_M, TILE_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+            S += scale * tl.dot(Q, K)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
 
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+                S,
+                float("-inf"),
+            )
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+            if SLIDING_WINDOW > 0:
+                S = tl.where(
+                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                    S,
+                    float("-inf"),
+                )
+
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len)
+
+            if USE_QQ_BIAS:
+                # compute key positions relative to query section
+                key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
+                # load bias only for keys that correspond to queries
+                is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],  # avoid OOB for context keys
+                    other=0.0,
+                )
+                S += qq_bias
+
+            # compute running maximum
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            # P : (BLOCK_M, TILE_SIZE,)
+            P = tl.exp(S - m_j[:, None])
+
+            # l_j : (BLOCK_M,)
+            l_j = tl.sum(P, axis=1)
+
+            # alpha : (BLOCK_M, )
+            alpha = tl.exp(M - m_j)
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc = acc * alpha[:, None]
+
+            # update constants
+            L = L * alpha + l_j
+            M = m_j
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -792,6 +982,14 @@ def unified_attention(
     # and at least 16 for all other data types.
     TILE_SIZE_PREFILL = 32
     TILE_SIZE_DECODE = 16 if q.element_size() >= 2 else 32
+
+    if (
+        current_platform.is_rocm()
+        and current_platform.is_navi()
+        and q.element_size() >= 2
+    ):
+        TILE_SIZE_PREFILL = block_size
+        TILE_SIZE_DECODE = block_size
 
     # if batch contains a prefill
     if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
